@@ -53,6 +53,7 @@ type Authenticator struct {
 	collation         uint8
 	proxyProtocol     bool
 	requireBackendTLS bool
+	emptyPassword     bool
 }
 
 func NewAuthenticator(config *BCConfig) *Authenticator {
@@ -179,6 +180,7 @@ func (auth *Authenticator) handshakeFirstTime(ctx context.Context, logger *zap.L
 	auth.collation = clientResp.Collation
 	auth.attrs = clientResp.Attrs
 	auth.zstdLevel = clientResp.ZstdLevel
+	auth.emptyPassword = len(clientResp.AuthData) == 0
 
 RECONNECT:
 
@@ -314,11 +316,17 @@ func (auth *Authenticator) handshakeWithBackend(ctx context.Context, logger *zap
 	auth.dbname = dbName
 	auth.capability = handshakeHandler.GetCapability() | pnet.ClientConnectWithDB
 	auth.collation = pnet.Collation
+	auth.emptyPassword = password == ""
 	if err = auth.writeAuthHandshake(backendIO, backendTLSConfig, initialHandshake.Capability, initialHandshake.AuthPlugin, authData, 0); err != nil {
 		return err
 	}
+	return finishBackendPasswordAuth(backendIO, password, authData)
+}
+
+func finishBackendPasswordAuth(backendIO pnet.PacketIO, password string, authData []byte) error {
 	for {
-		if pkt, err = backendIO.ReadPacket(); err != nil {
+		pkt, err := backendIO.ReadPacket()
+		if err != nil {
 			return err
 		}
 		switch pkt[0] {
@@ -326,19 +334,23 @@ func (auth *Authenticator) handshakeWithBackend(ctx context.Context, logger *zap
 			return nil
 		case pnet.AuthSwitchHeader.Byte():
 			idx := bytes.IndexByte(pkt[1:], 0)
+			if idx < 0 || idx+2 >= len(pkt) {
+				return mysql.ErrMalformPacket
+			}
 			authPlugin := string(pkt[1 : idx+1])
 			salt := pkt[idx+2 : len(pkt)-1]
 			if len(salt) != 20 {
 				return mysql.ErrMalformPacket
 			}
-			if authData, err = pnet.GenerateAuthResp(password, authPlugin, salt); err != nil {
+			authData, err = pnet.GenerateAuthResp(password, authPlugin, salt)
+			if err != nil {
 				return err
 			}
-			if err = backendIO.WritePacket(authData, true); err != nil {
+			if err := backendIO.WritePacket(authData, true); err != nil {
 				return err
 			}
 		case pnet.ShaCommand:
-			if err = backendIO.WritePacket(authData, true); err != nil {
+			if err := backendIO.WritePacket(authData, true); err != nil {
 				return err
 			}
 		case pnet.ErrHeader.Byte():
@@ -381,6 +393,54 @@ func (auth *Authenticator) handshakeSecondTime(logger *zap.Logger, clientIO, bac
 		}
 	}
 	return errors.Wrap(err, ErrBackendHandshake)
+}
+
+func (auth *Authenticator) canPristineReroute() bool {
+	return auth.emptyPassword
+}
+
+// handshakePristineEmptyPassword authenticates a new backend without client
+// participation. It is intentionally unavailable for non-empty credentials.
+func (auth *Authenticator) handshakePristineEmptyPassword(
+	logger *zap.Logger,
+	clientIO, backendIO pnet.PacketIO,
+	backendTLSConfig *tls.Config,
+) error {
+	if !auth.emptyPassword {
+		return errors.Wrapf(ErrBackendHandshake, "pristine reroute requires empty-password authentication")
+	}
+	if err := auth.writeProxyProtocol(clientIO, backendIO); err != nil {
+		return err
+	}
+	serverPacket, backendCapability, err := auth.readInitialHandshake(backendIO)
+	if err != nil {
+		return err
+	}
+	if err := auth.verifyBackendCaps(logger, backendCapability); err != nil {
+		return err
+	}
+	initialHandshake := pnet.ParseInitialHandshake(serverPacket)
+	authData, err := pnet.GenerateAuthResp("", initialHandshake.AuthPlugin, initialHandshake.Salt[:])
+	if err != nil {
+		return errors.Wrap(err, ErrBackendHandshake)
+	}
+	if err := auth.writeAuthHandshake(
+		backendIO,
+		backendTLSConfig,
+		backendCapability,
+		initialHandshake.AuthPlugin,
+		authData,
+		0,
+	); err != nil {
+		return err
+	}
+	if err := finishBackendPasswordAuth(backendIO, "", authData); err != nil {
+		return errors.Wrap(err, ErrBackendHandshake)
+	}
+	if err := setCompress(backendIO, auth.capability&backendCapability, auth.zstdLevel); err != nil {
+		return errors.Wrap(err, ErrBackendHandshake)
+	}
+	return nil
 }
 
 func (auth *Authenticator) readInitialHandshake(backendIO pnet.PacketIO) (serverPkt []byte, capability pnet.Capability, err error) {

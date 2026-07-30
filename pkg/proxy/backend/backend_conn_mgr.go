@@ -90,17 +90,18 @@ const (
 )
 
 type BCConfig struct {
-	HealthyKeepAlive     config.KeepAlive
-	UnhealthyKeepAlive   config.KeepAlive
-	FromPublicEndpoints  func(addr net.Addr) bool
-	DialContext          func(ctx context.Context, backend router.BackendInst, addr string) (net.Conn, error)
-	TickerInterval       time.Duration
-	CheckBackendInterval time.Duration
-	DialTimeout          time.Duration
-	ConnectTimeout       time.Duration
-	ConnBufferSize       int
-	ProxyProtocol        bool
-	RequireBackendTLS    bool
+	HealthyKeepAlive        config.KeepAlive
+	UnhealthyKeepAlive      config.KeepAlive
+	FromPublicEndpoints     func(addr net.Addr) bool
+	DialContext             func(ctx context.Context, backend router.BackendInst, addr string) (net.Conn, error)
+	TickerInterval          time.Duration
+	CheckBackendInterval    time.Duration
+	DialTimeout             time.Duration
+	ConnectTimeout          time.Duration
+	ConnBufferSize          int
+	ProxyProtocol           bool
+	RequireBackendTLS       bool
+	TableGroupRouteResolver TableGroupRouteResolver
 }
 
 func (cfg *BCConfig) check() {
@@ -171,6 +172,9 @@ type BackendConnManager struct {
 	cpt                capture.Capture
 	meter              Meter
 	fromPublicEndpoint bool
+	// tableGroupRerouteSafe stays true only while discarding the backend session
+	// cannot lose client-visible state.
+	tableGroupRerouteSafe bool
 }
 
 // NewBackendConnManager creates a BackendConnManager.
@@ -185,11 +189,12 @@ func NewBackendConnManager(logger *zap.Logger, handshakeHandler HandshakeHandler
 		handshakeHandler: handshakeHandler,
 		authenticator:    NewAuthenticator(config),
 		// There are 2 types of signals, which may be sent concurrently.
-		signalReceived: make(chan signalType, signalTypeNums),
-		redirectResCh:  make(chan *redirectResult, 1),
-		quitSource:     SrcNone,
-		cpt:            cpt,
-		meter:          meter,
+		signalReceived:        make(chan signalType, signalTypeNums),
+		redirectResCh:         make(chan *redirectResult, 1),
+		quitSource:            SrcNone,
+		cpt:                   cpt,
+		meter:                 meter,
+		tableGroupRerouteSafe: true,
 	}
 	mgr.ctxmap.m = make(map[any]any)
 	mgr.SetValue(ConnContextKeyConnID, connectionID)
@@ -461,6 +466,11 @@ func (mgr *BackendConnManager) ExecuteCmd(ctx context.Context) (cmd pnet.Command
 	}
 	waitingRedirect := mgr.redirectInfo.Load() != nil
 	var holdRequest bool
+	tableGroupRoutingStatement, routeErr := mgr.routeTableGroupStatement(ctx, request)
+	if routeErr != nil {
+		err = mgr.writeTableGroupRoutingError(routeErr)
+		return
+	}
 	backendIO := *mgr.backendIO.Load()
 	if cmd == pnet.ComStmtPrepare {
 		mgr.cmdProcessor.prepareEndHook = func(id uint32) {
@@ -468,6 +478,9 @@ func (mgr *BackendConnManager) ExecuteCmd(ctx context.Context) (cmd pnet.Command
 		}
 	}
 	holdRequest, err = mgr.cmdProcessor.executeCmd(request, mgr.clientIO, backendIO, waitingRedirect, streamingForward)
+	if !tableGroupRoutingStatement && cmd != pnet.ComPing {
+		mgr.tableGroupRerouteSafe = false
+	}
 	if !holdRequest {
 		addCmdMetrics(cmd, backendIO.RemoteAddr().String(), startTime)
 		mgr.updateTraffic(backendIO)

@@ -120,6 +120,8 @@ func init() {
 		BackendScoreGauge,
 		HealthCheckCycleGauge,
 		BackendMetricGauge,
+		TableGroupRouteCounter,
+		TableGroupRerouteCounter,
 		PendingMigrateGuage,
 		MigrateCounter,
 		MigrateDurationHistogram,

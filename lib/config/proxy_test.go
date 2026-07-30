@@ -396,3 +396,17 @@ func TestGetBackendClusters(t *testing.T) {
 	cfg.Proxy.PDAddrs = ""
 	require.Nil(t, cfg.GetBackendClusters())
 }
+
+func TestBackendClusterTableGroupRoutingConfig(t *testing.T) {
+	cfg := NewConfig()
+	cfg.Proxy.BackendClusters = []BackendCluster{{
+		Name:                 "cluster-a",
+		PDAddrs:              "127.0.0.1:2379",
+		TableGroupKeyspaceID: 42,
+		TableGroupID:         101,
+	}}
+	require.NoError(t, cfg.Check())
+
+	cfg.Proxy.BackendClusters[0].TableGroupID = 0
+	require.ErrorContains(t, cfg.Check(), "table-group-id must be non-zero")
+}

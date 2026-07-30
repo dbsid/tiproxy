@@ -331,6 +331,20 @@ func TestClusterReusableIgnoresNSServerOrder(t *testing.T) {
 	require.True(t, reusable)
 }
 
+func TestClusterReusableIncludesTableGroupIdentity(t *testing.T) {
+	cluster := &Cluster{cfg: config.BackendCluster{
+		Name:                 "cluster-a",
+		PDAddrs:              "pd1:2379",
+		TableGroupKeyspaceID: 42,
+		TableGroupID:         101,
+	}}
+
+	require.True(t, clusterReusable(cluster, cluster.cfg))
+	changed := cluster.cfg
+	changed.TableGroupID++
+	require.False(t, clusterReusable(cluster, changed))
+}
+
 func TestManagerGetTiDBTopologySkipsUnavailableCluster(t *testing.T) {
 	clusterA := newManagerTestEtcdCluster(t)
 	clusterB := newManagerTestEtcdCluster(t)

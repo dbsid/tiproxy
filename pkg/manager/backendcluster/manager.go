@@ -167,7 +167,9 @@ func clusterReusable(cluster *Cluster, cfg config.BackendCluster) bool {
 	right := normalizeCluster(cfg)
 	return left.Name == right.Name &&
 		left.PDAddrs == right.PDAddrs &&
-		slices.Equal(left.NSServers, right.NSServers)
+		slices.Equal(left.NSServers, right.NSServers) &&
+		left.TableGroupKeyspaceID == right.TableGroupKeyspaceID &&
+		left.TableGroupID == right.TableGroupID
 }
 
 func (m *Manager) Snapshot() map[string]*Cluster {
@@ -204,6 +206,28 @@ func (m *Manager) PrimaryCluster() *Cluster {
 		return cluster
 	}
 	return nil
+}
+
+// ResolveTableGroupRoute selects one SQL leader from the configured cluster's
+// current validated PD route snapshot.
+func (m *Manager) ResolveTableGroupRoute(
+	ctx context.Context,
+	clusterName string,
+	routingValue uint64,
+) (TableGroupRouteTarget, error) {
+	var cluster *Cluster
+	if clusterName == "" {
+		cluster = m.PrimaryCluster()
+	} else {
+		cluster = m.Snapshot()[clusterName]
+	}
+	if cluster == nil {
+		return TableGroupRouteTarget{}, errors.Wrapf(ErrBackendClusterNotFound, "cluster %s", clusterName)
+	}
+	if cluster.tableGroupRouter == nil {
+		return TableGroupRouteTarget{}, ErrTableGroupRoutingDisabled
+	}
+	return cluster.tableGroupRouter.resolve(ctx, routingValue)
 }
 
 func (m *Manager) PreClose() {

@@ -83,6 +83,10 @@ func (mp *mockProxy) authenticateSecondTime(clientIO, backendIO pnet.PacketIO) e
 	return mp.authenticator.handshakeSecondTime(mp.logger, clientIO, backendIO, mp.backendTLSConfig, mp.sessionToken)
 }
 
+func (mp *mockProxy) authenticatePristineEmptyPassword(clientIO, backendIO pnet.PacketIO) error {
+	return mp.authenticator.handshakePristineEmptyPassword(mp.logger, clientIO, backendIO, mp.backendTLSConfig)
+}
+
 func (mp *mockProxy) authenticateWithBackend(_, backendIO pnet.PacketIO) error {
 	if err := mp.authenticator.handshakeWithBackend(context.Background(), mp.logger, mp, mp.handshakeHandler,
 		mp.username, mp.password, mp.dbName, func(ctx context.Context, cctx ConnContext, resp *pnet.HandshakeResp) (pnet.PacketIO, error) {

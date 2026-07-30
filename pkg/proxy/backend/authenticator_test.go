@@ -87,6 +87,37 @@ func TestUnsupportedCapability(t *testing.T) {
 	}
 }
 
+func TestHandshakePristineEmptyPassword(t *testing.T) {
+	tc := newTCPConnSuite(t)
+	ts, clean := newTestSuite(t, tc, func(cfg *testConfig) {
+		cfg.clientConfig.authData = nil
+		cfg.clientConfig.authPlugin = pnet.AuthNativePassword
+		cfg.backendConfig.authPlugin = pnet.AuthNativePassword
+	})
+	defer clean()
+
+	ts.authenticateFirstTime(t, func(t *testing.T, ts *testSuite) {
+		require.NoError(t, ts.mc.err)
+		require.NoError(t, ts.mb.err)
+		require.NoError(t, ts.mp.err)
+		require.True(t, ts.mc.authSucceed)
+		require.Empty(t, ts.mb.authData)
+	})
+	require.True(t, ts.mp.authenticator.canPristineReroute())
+
+	tc.reconnectBackend(t)
+	ts.runAndCheck(t, nil, nil, ts.mb.authenticate, ts.mp.authenticatePristineEmptyPassword)
+	require.Equal(t, ts.mc.username, ts.mb.username)
+	require.Equal(t, ts.mc.dbName, ts.mb.db)
+	require.Empty(t, ts.mb.authData)
+}
+
+func TestHandshakePristineRejectsNonEmptyPassword(t *testing.T) {
+	auth := &Authenticator{emptyPassword: false}
+	err := auth.handshakePristineEmptyPassword(nil, nil, nil, nil)
+	require.ErrorIs(t, err, ErrBackendHandshake)
+}
+
 func TestAuthPlugin(t *testing.T) {
 	cfgs := [][]cfgOverrider{
 		{

@@ -47,18 +47,19 @@ type BackendDialer interface {
 }
 
 type SQLServer struct {
-	listeners  []net.Listener
-	addrs      []string
-	logger     *zap.Logger
-	certMgr    *cert.CertManager
-	idMgr      *id.IDManager
-	memUsage   memoryStateProvider
-	hsHandler  backend.HandshakeHandler
-	cpt        capture.Capture
-	meter      backend.Meter
-	dialer     BackendDialer
-	wg         waitgroup.WaitGroup
-	cancelFunc context.CancelFunc
+	listeners               []net.Listener
+	addrs                   []string
+	logger                  *zap.Logger
+	certMgr                 *cert.CertManager
+	idMgr                   *id.IDManager
+	memUsage                memoryStateProvider
+	hsHandler               backend.HandshakeHandler
+	cpt                     capture.Capture
+	meter                   backend.Meter
+	dialer                  BackendDialer
+	tableGroupRouteResolver backend.TableGroupRouteResolver
+	wg                      waitgroup.WaitGroup
+	cancelFunc              context.CancelFunc
 
 	mu serverState
 }
@@ -135,6 +136,11 @@ func (s *SQLServer) reset(cfg *config.Config) {
 
 func (s *SQLServer) SetBackendDialer(dialer BackendDialer) {
 	s.dialer = dialer
+}
+
+// SetTableGroupRouteResolver installs the cluster-scoped PD route resolver.
+func (s *SQLServer) SetTableGroupRouteResolver(resolver backend.TableGroupRouteResolver) {
+	s.tableGroupRouteResolver = resolver
 }
 
 func (s *SQLServer) Run(ctx context.Context, cfgch <-chan *config.Config) {
@@ -225,6 +231,7 @@ func (s *SQLServer) onConn(ctx context.Context, conn net.Conn, addr string) {
 					var dialer net.Dialer
 					return dialer.DialContext(ctx, "tcp", addr)
 				},
+				TableGroupRouteResolver: s.tableGroupRouteResolver,
 			}, s.meter)
 		s.mu.clients[connID] = clientConn
 		connBufferMemDelta = estimateConnBufferMemDelta(s.mu.connBufferSize)

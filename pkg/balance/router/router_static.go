@@ -125,3 +125,8 @@ func (b *StaticBackend) SetKeyspace(k string) {
 func (b *StaticBackend) ClusterName() string {
 	return b.cluster
 }
+
+// SetClusterName binds a direct backend to the cluster-scoped network dialer.
+func (b *StaticBackend) SetClusterName(cluster string) {
+	b.cluster = cluster
+}

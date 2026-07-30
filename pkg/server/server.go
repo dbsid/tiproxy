@@ -176,6 +176,25 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 			return
 		}
 		srv.proxy.SetBackendDialer(srv.clusterManager.NetworkRouter())
+		srv.proxy.SetTableGroupRouteResolver(func(
+			ctx context.Context,
+			clusterName string,
+			routingValue uint64,
+		) (backend.TableGroupRouteTarget, error) {
+			target, err := srv.clusterManager.ResolveTableGroupRoute(ctx, clusterName, routingValue)
+			if err != nil {
+				return backend.TableGroupRouteTarget{}, err
+			}
+			return backend.TableGroupRouteTarget{
+				ClusterName:     target.ClusterName,
+				Address:         target.Address,
+				FragmentID:      target.FragmentID,
+				LeaderStoreID:   target.LeaderStoreID,
+				RegionID:        target.RegionID,
+				MetadataVersion: target.MetadataVersion,
+				StatusVersion:   target.StatusVersion,
+			}, nil
+		})
 		srv.proxy.Run(ctx, srv.configManager.WatchConfig())
 	}
 

@@ -138,8 +138,9 @@ func (cp *CmdProcessor) forwardPrepareCmd(clientIO, backendIO pnet.PacketIO) err
 	}
 	switch response[0] {
 	case pnet.OKHeader.Byte():
+		stmtID := binary.LittleEndian.Uint32(response[1:])
+		cp.addPreparedStatement(stmtID)
 		if cp.prepareEndHook != nil {
-			stmtID := binary.LittleEndian.Uint32(response[1:])
 			cp.prepareEndHook(stmtID)
 		}
 		// The OK packet doesn't contain a server status.

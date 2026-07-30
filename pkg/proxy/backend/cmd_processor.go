@@ -21,6 +21,7 @@ const (
 type CmdProcessor struct {
 	// Each prepared statement has an independent status.
 	preparedStmtStatus map[int]uint32
+	preparedStatements map[int]struct{}
 	capability         pnet.Capability
 	// Only includes in_trans or quit status.
 	serverStatus uint32
@@ -34,6 +35,7 @@ func NewCmdProcessor(logger *zap.Logger) *CmdProcessor {
 	return &CmdProcessor{
 		serverStatus:       0,
 		preparedStmtStatus: make(map[int]uint32),
+		preparedStatements: make(map[int]struct{}),
 		logger:             logger,
 	}
 }
@@ -78,6 +80,7 @@ func (cp *CmdProcessor) updatePrepStmtStatus(request []byte, serverStatus uint16
 		stmtID = int(binary.LittleEndian.Uint32(request[1:5]))
 	case pnet.ComResetConnection, pnet.ComChangeUser:
 		cp.preparedStmtStatus = make(map[int]uint32)
+		cp.preparedStatements = make(map[int]struct{})
 		return
 	default:
 		return
@@ -99,6 +102,17 @@ func (cp *CmdProcessor) updatePrepStmtStatus(request []byte, serverStatus uint16
 	} else {
 		delete(cp.preparedStmtStatus, stmtID)
 	}
+	if cmd == pnet.ComStmtClose {
+		delete(cp.preparedStatements, stmtID)
+	}
+}
+
+func (cp *CmdProcessor) addPreparedStatement(stmtID uint32) {
+	cp.preparedStatements[int(stmtID)] = struct{}{}
+}
+
+func (cp *CmdProcessor) hasPreparedStatements() bool {
+	return len(cp.preparedStatements) > 0
 }
 
 func (cp *CmdProcessor) finishedTxn() bool {

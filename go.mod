@@ -18,7 +18,7 @@ require (
 	github.com/j-keck/arping v1.0.3
 	github.com/klauspost/compress v1.18.0
 	github.com/pelletier/go-toml/v2 v2.2.2
-	github.com/pingcap/kvproto v0.0.0-20260622063236-b41e86365ce0
+	github.com/pingcap/kvproto v0.0.0-20260730092306-0e5d7fd69092
 	github.com/pingcap/metering_sdk v0.0.0-20260324055927-14fead745f1d
 	github.com/pingcap/sysutil v1.0.1-0.20240311050922-ae81ee01f3a5
 	github.com/pingcap/tidb v1.1.0-beta.0.20260715020929-1750c20993e2

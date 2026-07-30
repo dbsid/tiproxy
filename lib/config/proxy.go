@@ -88,9 +88,12 @@ type ProxyServer struct {
 }
 
 type BackendCluster struct {
-	Name      string   `yaml:"name,omitempty" toml:"name,omitempty" json:"name,omitempty" reloadable:"true"`
-	PDAddrs   string   `yaml:"pd-addrs,omitempty" toml:"pd-addrs,omitempty" json:"pd-addrs,omitempty" reloadable:"true"`
-	NSServers []string `yaml:"ns-servers,omitempty" toml:"ns-servers,omitempty" json:"ns-servers,omitempty" reloadable:"true"`
+	Name                 string   `yaml:"name,omitempty" toml:"name,omitempty" json:"name,omitempty" reloadable:"true"`
+	PDAddrs              string   `yaml:"pd-addrs,omitempty" toml:"pd-addrs,omitempty" json:"pd-addrs,omitempty" reloadable:"true"`
+	NSServers            []string `yaml:"ns-servers,omitempty" toml:"ns-servers,omitempty" json:"ns-servers,omitempty" reloadable:"true"`
+	TableGroupKeyspaceID uint32   `yaml:"table-group-keyspace-id,omitempty" toml:"table-group-keyspace-id,omitempty" json:"table-group-keyspace-id,omitempty" reloadable:"true"`
+	// TableGroupID enables first-statement Table Group routing when it is non-zero.
+	TableGroupID uint64 `yaml:"table-group-id,omitempty" toml:"table-group-id,omitempty" json:"table-group-id,omitempty" reloadable:"true"`
 }
 
 type API struct {
@@ -319,6 +322,10 @@ func (ps *ProxyServer) Check() error {
 		}
 		if _, err := ParseNSServers(cluster.NSServers); err != nil {
 			return errors.Wrapf(ErrInvalidConfigValue, "invalid proxy.backend-clusters.ns-servers: %s", err.Error())
+		}
+		if cluster.TableGroupID == 0 && cluster.TableGroupKeyspaceID != 0 {
+			return errors.Wrapf(ErrInvalidConfigValue,
+				"proxy.backend-clusters[%d].table-group-id must be non-zero when table-group-keyspace-id is set", i)
 		}
 	}
 

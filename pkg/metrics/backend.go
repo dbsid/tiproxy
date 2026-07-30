@@ -67,4 +67,20 @@ var (
 			Name:      "backend_metric",
 			Help:      "The backend metric.",
 		}, []string{LblBackend, LblMetricName})
+
+	TableGroupRouteCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: ModuleProxy,
+			Subsystem: LabelBackend,
+			Name:      "table_group_route",
+			Help:      "Counter of bounded Table Group route-cache outcomes.",
+		}, []string{LblRes})
+
+	TableGroupRerouteCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: ModuleProxy,
+			Subsystem: LabelBackend,
+			Name:      "table_group_reroute",
+			Help:      "Counter of bounded Table Group backend-routing outcomes.",
+		}, []string{LblRes})
 )

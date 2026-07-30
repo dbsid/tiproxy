@@ -21,12 +21,13 @@ import (
 
 // Cluster is the cluster-scoped container for one backend PD cluster.
 type Cluster struct {
-	cfg        config.BackendCluster
-	etcdCli    *clientv3.Client
-	infoSyncer *infosync.InfoSyncer
-	metrics    *metricsreader.ClusterReader
-	httpCli    *httputil.Client
-	dialer     *netutil.DNSDialer
+	cfg              config.BackendCluster
+	etcdCli          *clientv3.Client
+	infoSyncer       *infosync.InfoSyncer
+	metrics          *metricsreader.ClusterReader
+	httpCli          *httputil.Client
+	dialer           *netutil.DNSDialer
+	tableGroupRouter *tableGroupRouter
 }
 
 func (c *Cluster) Config() config.BackendCluster {
@@ -38,6 +39,17 @@ func (c *Cluster) EtcdClient() *clientv3.Client {
 }
 
 func (c *Cluster) GetTiDBTopology(ctx context.Context) (map[string]*infosync.TiDBTopologyInfo, error) {
+	if c.tableGroupRouter != nil {
+		targets, err := c.tableGroupRouter.targets(ctx)
+		if err != nil {
+			return nil, err
+		}
+		topology := make(map[string]*infosync.TiDBTopologyInfo, len(targets))
+		for _, target := range targets {
+			topology[target.Address] = &infosync.TiDBTopologyInfo{Addr: target.Address}
+		}
+		return topology, nil
+	}
 	return c.infoSyncer.GetTiDBTopology(ctx)
 }
 
@@ -113,6 +125,20 @@ func NewCluster(
 		infoSyncer: infoSyncer,
 		httpCli:    httpCli,
 		dialer:     dialer,
+	}
+	if clusterCfg.TableGroupID != 0 {
+		cluster.tableGroupRouter, err = newTableGroupRouter(
+			ctx,
+			clusterCfg.Name,
+			clusterCfg.TableGroupKeyspaceID,
+			clusterCfg.TableGroupID,
+			etcdCli,
+		)
+		if err != nil {
+			_ = infoSyncer.Close()
+			_ = etcdCli.Close()
+			return nil, err
+		}
 	}
 	cluster.metrics = metricsreader.NewClusterReader(
 		logger.With(zap.String("cluster", clusterCfg.Name)).Named("metrics"),
