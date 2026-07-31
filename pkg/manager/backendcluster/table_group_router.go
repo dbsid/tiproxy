@@ -226,6 +226,10 @@ func (r *tableGroupRouter) validateResponse(response *table_grouppb.GetTableGrou
 	}
 	if detail := response.GetHeader().GetError(); detail != nil &&
 		detail.GetCode() != table_grouppb.TableGroupErrorCode_TABLE_GROUP_ERROR_CODE_OK {
+		if detail.GetMessage() != "" {
+			return errors.Wrapf(ErrInvalidTableGroupRoute, "PD returned Table Group error code %s: %s",
+				detail.GetCode(), detail.GetMessage())
+		}
 		return errors.Wrapf(ErrInvalidTableGroupRoute, "PD returned Table Group error code %s", detail.GetCode())
 	}
 	return validateTableGroupRoute(response.GetRoute(), &r.identity)

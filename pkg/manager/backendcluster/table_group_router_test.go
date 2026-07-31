@@ -149,6 +149,24 @@ func TestTableGroupRouterRejectsMissingSQLEndpoint(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidTableGroupRoute)
 }
 
+func TestTableGroupRouterIncludesPDErrorMessage(t *testing.T) {
+	now := time.Unix(100, 0)
+	router := newTestTableGroupRouter(nil, &now)
+	response := &table_grouppb.GetTableGroupRouteResponse{
+		Header: &table_grouppb.ResponseHeader{
+			ClusterId: 9,
+			Error: &table_grouppb.TableGroupError{
+				Code:    table_grouppb.TableGroupErrorCode_TABLE_GROUP_ERROR_CODE_REGION_MISMATCH,
+				Message: "fragment 8 is not route-ready",
+			},
+		},
+	}
+
+	err := router.validateResponse(response)
+	require.ErrorIs(t, err, ErrInvalidTableGroupRoute)
+	require.ErrorContains(t, err, "fragment 8 is not route-ready")
+}
+
 func TestValidateTableGroupRouteRejectsInvalidSnapshots(t *testing.T) {
 	tests := []struct {
 		name   string
