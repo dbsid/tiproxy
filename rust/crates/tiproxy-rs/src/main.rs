@@ -136,6 +136,22 @@ const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridg
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // tidb-one: transaction-level locality routing mode.
+    if env::args().nth(1).as_deref() == Some("locality-router") {
+        return match locality_router::parse_options(env::args().skip(2)) {
+            Ok(options) => match locality_router::run(options).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("tiproxy-rs locality-router stopped: {error}");
+                    ExitCode::from(1)
+                }
+            },
+            Err(error) => {
+                eprintln!("tiproxy-rs locality-router: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let command = match parse_options(env::args().skip(1)) {
         Ok(command) => command,
         Err(error) => {

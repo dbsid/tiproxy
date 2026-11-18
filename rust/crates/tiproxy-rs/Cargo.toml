@@ -24,6 +24,7 @@ control-topology.workspace = true
 dataplane.workspace = true
 session-core.workspace = true
 legacy-router-shadow.workspace = true
+locality-router.workspace = true
 if-addrs.workspace = true
 libc.workspace = true
 rustix.workspace = true

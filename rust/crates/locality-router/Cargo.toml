@@ -1,0 +1,19 @@
+[package]
+name = "locality-router"
+description = "Transaction-level locality routing for tidb-one (TiDB and TiKV in one process)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
