@@ -4,12 +4,12 @@
 //! Connection IDs and `KILL`.
 //!
 //! A routed session runs its statements on one of several backend
-//! connections, and each has its own TiDB connection ID. The client only knows
+//! connections, and each has its own `TiDB` connection ID. The client only knows
 //! the ID of the connection it authenticated on (from the greeting), and
 //! `CONNECTION_ID()` returns the ID of whichever connection runs the query.
 //! The registry maps every backend connection ID of every live session in
 //! this router to the session, so `KILL [QUERY] id` with any of them can be
-//! rewritten to the connection that runs the session right now. TiDB's global
+//! rewritten to the connection that runs the session right now. `TiDB`'s global
 //! kill then delivers it to the right server.
 
 use std::collections::HashMap;
@@ -33,6 +33,7 @@ static REGISTRY: LazyLock<Mutex<HashMap<u32, Weak<SessionHandle>>>> =
 impl SessionHandle {
     /// Creates a handle whose current connection is `(addr, id)` and
     /// registers `id`.
+    #[must_use]
     pub fn new(addr: &str, id: u32) -> Arc<Self> {
         let h = Arc::new(Self::default());
         h.set_current(addr, id);

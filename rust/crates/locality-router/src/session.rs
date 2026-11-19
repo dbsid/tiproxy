@@ -12,13 +12,13 @@
 //! # Session state
 //!
 //! The session keeps one connection per backend it has used. State is kept
-//! consistent between them by category, after OBProxy's per-category
+//! consistent between them by category, after `OBProxy`'s per-category
 //! versions:
 //!
 //! * **Durable state** (everything `SHOW SESSION_STATES` carries: variables,
 //!   current database, text-protocol prepared statements, sequences, ...)
 //!   has a version. With tidb-one session tracking
-//!   (`tidb_one_session_track = ON`) TiDB reports in the server status of each
+//!   (`tidb_one_session_track = ON`) `TiDB` reports in the server status of each
 //!   response whether the statement may have changed it; otherwise the
 //!   router's SQL classifier decides. A connection behind the current version
 //!   is re-synchronized with `SHOW SESSION_STATES` on the current connection,
@@ -78,7 +78,7 @@ struct BackendConn {
     conn: PacketConn,
     /// Server status of the last response (tracking bits removed).
     status: u16,
-    /// TiDB connection ID from the greeting.
+    /// `TiDB` connection ID from the greeting.
     conn_id: u32,
     /// tidb-one session tracking is on for this connection.
     tracking: bool,
@@ -127,6 +127,7 @@ struct Stmt {
 
 /// What tidb-one session tracking reported for one statement.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent flags read from server status bits.
 struct Observed {
     /// A status-bearing packet was seen.
     status_seen: bool,
@@ -221,7 +222,12 @@ fn set_stmt_id(pkt: &mut [u8], id: u32) {
 }
 
 impl Session {
-    /// Authenticates `client` through `backend_addr` and returns the session.
+    /// Authenticates `client` through `backend_addr` and returns the session,
+    /// or `None` if the backend rejected the login.
+    ///
+    /// # Errors
+    ///
+    /// Network and protocol errors on either connection.
     pub async fn handshake(
         router: Arc<Router>,
         client: TcpStream,
@@ -297,7 +303,7 @@ impl Session {
     }
 
     /// Turns on tidb-one session tracking for backend `i`. A server without it
-    /// (upstream TiDB) answers with an error and the session falls back to the
+    /// (upstream `TiDB`) answers with an error and the session falls back to the
     /// SQL classifier.
     async fn enable_tracking(&mut self, i: usize) -> io::Result<()> {
         if !self.router.options.session_track {
@@ -332,6 +338,10 @@ impl Session {
 
     /// Serves commands until the client quits, the session is killed, or a
     /// connection fails.
+    ///
+    /// # Errors
+    ///
+    /// The error that ended the session.
     pub async fn run(mut self) -> io::Result<()> {
         let handle = Arc::clone(&self.handle);
         let result = loop {
@@ -372,7 +382,7 @@ impl Session {
         self.router
             .counters
             .backend_conns
-            .fetch_sub(n as i64, Ordering::Relaxed);
+            .fetch_sub(i64::try_from(n).unwrap_or(i64::MAX), Ordering::Relaxed);
         result
     }
 
@@ -560,18 +570,19 @@ impl Session {
             self.backends[self.cur].lii = Some(states_lii);
         }
         let (i, kind) = match existing {
-            Some(i) => match self.reset_and_apply(i, &states).await {
-                Ok(true) => (i, SwitchKind::Migrate),
-                // The reset was refused or the connection broke: its state is
-                // unknown; replace it with a new one.
-                Ok(false) | Err(_) => {
+            Some(i) => {
+                if let Ok(true) = self.reset_and_apply(i, &states).await {
+                    (i, SwitchKind::Migrate)
+                } else {
+                    // The reset was refused or the connection broke: its
+                    // state is unknown; replace it with a new one.
                     self.backends[i].synced = UNSYNCED;
                     (
                         self.dial_and_apply(addr, &token, &states, Some(i)).await?,
                         SwitchKind::Dial,
                     )
                 }
-            },
+            }
             None => (
                 self.dial_and_apply(addr, &token, &states, None).await?,
                 SwitchKind::Dial,
@@ -694,18 +705,15 @@ impl Session {
         self.handle.register(g.conn_id);
         let fresh = BackendConn::new(addr, conn, g.conn_id, st);
         let counters = &self.router.counters;
-        match replace {
-            Some(i) => {
-                let mut old = std::mem::replace(&mut self.backends[i], fresh);
-                old.conn.reset_seq();
-                let _ = old.conn.send(&[cmd::QUIT]).await;
-                Ok(i)
-            }
-            None => {
-                counters.backend_conns.fetch_add(1, Ordering::Relaxed);
-                self.backends.push(fresh);
-                Ok(self.backends.len() - 1)
-            }
+        if let Some(i) = replace {
+            let mut old = std::mem::replace(&mut self.backends[i], fresh);
+            old.conn.reset_seq();
+            let _ = old.conn.send(&[cmd::QUIT]).await;
+            Ok(i)
+        } else {
+            counters.backend_conns.fetch_add(1, Ordering::Relaxed);
+            self.backends.push(fresh);
+            Ok(self.backends.len() - 1)
         }
     }
 
@@ -1392,7 +1400,7 @@ impl Session {
                 && types.len() == 2 * n
             {
                 pkt[at] = 1;
-                pkt.splice(at + 1..at + 1, types);
+                pkt.splice((at + 1)..=at, types);
                 cur.typed.insert(id);
             }
         }
@@ -1469,10 +1477,10 @@ impl Session {
             b.conn.reset_seq();
             let _ = b.conn.send(&[cmd::QUIT]).await;
         }
-        self.router
-            .counters
-            .backend_conns
-            .fetch_sub(dropped as i64, Ordering::Relaxed);
+        self.router.counters.backend_conns.fetch_sub(
+            i64::try_from(dropped).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
         self.backends.push(keep);
         self.cur = 0;
         self.reset_router_state();
@@ -1676,7 +1684,7 @@ fn int_params(
                     Some(if unsigned {
                         i64::from(b)
                     } else {
-                        i64::from(b as i8)
+                        i64::from(b.cast_signed())
                     }),
                     1,
                 )
@@ -1688,7 +1696,7 @@ fn int_params(
                     Some(if unsigned {
                         i64::from(raw)
                     } else {
-                        i64::from(raw as i16)
+                        i64::from(raw.cast_signed())
                     }),
                     2,
                 )
@@ -1700,7 +1708,7 @@ fn int_params(
                     Some(if unsigned {
                         i64::from(raw)
                     } else {
-                        i64::from(raw as i32)
+                        i64::from(raw.cast_signed())
                     }),
                     4,
                 )
@@ -1709,9 +1717,11 @@ fn int_params(
                 let b = pkt.get(pos..pos + 8)?;
                 let raw = u64::from_le_bytes(b.try_into().ok()?);
                 (
-                    i64::try_from(raw)
-                        .ok()
-                        .or(if unsigned { None } else { Some(raw as i64) }),
+                    i64::try_from(raw).ok().or(if unsigned {
+                        None
+                    } else {
+                        Some(raw.cast_signed())
+                    }),
                     8,
                 )
             }

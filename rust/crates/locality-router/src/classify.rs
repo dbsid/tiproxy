@@ -87,6 +87,7 @@ pub struct Kill {
 
 impl Kill {
     /// Renders the statement for connection `id`.
+    #[must_use]
     pub fn sql(&self, id: u64) -> String {
         format!(
             "KILL {}{} {id}",
@@ -130,7 +131,9 @@ fn tokenize(sql: &[u8], limit: usize) -> Vec<Tok> {
             while i < sql.len() && sql[i] != b'`' {
                 i += 1;
             }
-            out.push(Tok::Quoted(String::from_utf8_lossy(&sql[start..i.min(sql.len())]).to_lowercase()));
+            out.push(Tok::Quoted(
+                String::from_utf8_lossy(&sql[start..i.min(sql.len())]).to_lowercase(),
+            ));
             i += 1;
         } else if c == b'\'' || c == b'"' {
             i += 1;
@@ -162,19 +165,33 @@ fn tokenize(sql: &[u8], limit: usize) -> Vec<Tok> {
             }
         } else if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 || c == b'$' {
             let start = i;
-            while i < sql.len() && (sql[i].is_ascii_alphanumeric() || sql[i] == b'_' || sql[i] >= 0x80 || sql[i] == b'$') {
+            while i < sql.len()
+                && (sql[i].is_ascii_alphanumeric()
+                    || sql[i] == b'_'
+                    || sql[i] >= 0x80
+                    || sql[i] == b'$')
+            {
                 i += 1;
             }
-            out.push(Tok::Word(String::from_utf8_lossy(&sql[start..i]).to_lowercase()));
+            out.push(Tok::Word(
+                String::from_utf8_lossy(&sql[start..i]).to_lowercase(),
+            ));
         } else if c == b'?' {
             out.push(Tok::Param);
             i += 1;
         } else if c == b'@' {
             let start = i;
-            while i < sql.len() && (sql[i] == b'@' || sql[i].is_ascii_alphanumeric() || sql[i] == b'_' || sql[i] == b'.') {
+            while i < sql.len()
+                && (sql[i] == b'@'
+                    || sql[i].is_ascii_alphanumeric()
+                    || sql[i] == b'_'
+                    || sql[i] == b'.')
+            {
                 i += 1;
             }
-            out.push(Tok::Var(String::from_utf8_lossy(&sql[start..i]).to_lowercase()));
+            out.push(Tok::Var(
+                String::from_utf8_lossy(&sql[start..i]).to_lowercase(),
+            ));
         } else {
             out.push(Tok::Punct(c));
             i += 1;
@@ -214,7 +231,10 @@ fn table_ref(toks: &[Tok], i: &mut usize) -> Option<(Option<String>, String)> {
 }
 
 fn is_reserved(w: &str) -> bool {
-    matches!(w, "select" | "where" | "set" | "values" | "value" | "(" | "dual" | "lateral")
+    matches!(
+        w,
+        "select" | "where" | "set" | "values" | "value" | "(" | "dual" | "lateral"
+    )
 }
 
 /// Finds the first `col = value` after `WHERE`, counting placeholders.
@@ -239,7 +259,10 @@ fn where_point(toks: &[Tok], from: usize) -> Option<Point> {
                 _ => None,
             };
             if let Some(value) = value {
-                return Some(Point { column: col.to_owned(), value });
+                return Some(Point {
+                    column: col.to_owned(),
+                    value,
+                });
             }
         }
         i += 1;
@@ -264,7 +287,9 @@ fn insert_points(toks: &[Tok], after_table: usize) -> Vec<(String, Value)> {
         i += 1;
     }
     i += 1;
-    if !matches!(word(toks.get(i)), Some("values" | "value")) || toks.get(i + 1) != Some(&Tok::Punct(b'(')) {
+    if !matches!(word(toks.get(i)), Some("values" | "value"))
+        || toks.get(i + 1) != Some(&Tok::Punct(b'('))
+    {
         return out;
     }
     let mut params = toks[..i].iter().filter(|t| **t == Tok::Param).count();
@@ -317,10 +342,14 @@ fn insert_points(toks: &[Tok], after_table: usize) -> Vec<(String, Value)> {
 }
 
 /// Classifies one SQL statement.
+#[allow(clippy::too_many_lines)] // One arm per statement kind.
 pub fn classify(sql: &[u8]) -> Classified {
     let toks = tokenize(sql, 4096);
     let has_var = toks.iter().any(|t| matches!(t, Tok::Var(_)));
-    let mentions = |names: &[&str]| toks.iter().any(|t| matches!(t, Tok::Word(w) if names.contains(&w.as_str())));
+    let mentions = |names: &[&str]| {
+        toks.iter()
+            .any(|t| matches!(t, Tok::Word(w) if names.contains(&w.as_str())))
+    };
     let session_fn = mentions(&[
         "last_insert_id",
         "found_rows",
@@ -333,7 +362,10 @@ pub fn classify(sql: &[u8]) -> Classified {
     ]);
     // A multi-statement query: only the first statement is classified, so
     // assume the others change session state.
-    let multi = toks.iter().position(|t| *t == Tok::Punct(b';')).is_some_and(|i| i + 1 < toks.len());
+    let multi = toks
+        .iter()
+        .position(|t| *t == Tok::Punct(b';'))
+        .is_some_and(|i| i + 1 < toks.len());
     let prev_dependent = mentions(&["found_rows", "row_count"])
         || toks.iter().any(|t| matches!(t, Tok::Var(v) if v.ends_with("warning_count") || v.ends_with("error_count")))
         || (word(toks.first()) == Some("show") && matches!(word(toks.get(1)), Some("warnings" | "errors" | "count")));
@@ -351,7 +383,13 @@ pub fn classify(sql: &[u8]) -> Classified {
         return c;
     };
     match first {
-        "begin" if toks.len() == 1 || matches!(word(toks.get(1)), Some("pessimistic" | "optimistic" | "work")) => {
+        "begin"
+            if toks.len() == 1
+                || matches!(
+                    word(toks.get(1)),
+                    Some("pessimistic" | "optimistic" | "work")
+                ) =>
+        {
             c.kind = Kind::Begin;
             c.simple_begin = toks.len() <= 2;
         }
@@ -376,7 +414,9 @@ pub fn classify(sql: &[u8]) -> Classified {
             return c;
         }
         "commit" => c.kind = Kind::Commit,
-        "rollback" if !mentions(&["savepoint"]) && word(toks.get(1)) != Some("to") => c.kind = Kind::Rollback,
+        "rollback" if !mentions(&["savepoint"]) && word(toks.get(1)) != Some("to") => {
+            c.kind = Kind::Rollback;
+        }
         "use" => {
             c.kind = Kind::Use;
             c.use_db = ident(toks.get(1)).map(str::to_owned);
@@ -419,7 +459,10 @@ pub fn classify(sql: &[u8]) -> Classified {
         "insert" | "replace" => {
             c.kind = Kind::Insert;
             let mut i = 1;
-            while matches!(word(toks.get(i)), Some("low_priority" | "delayed" | "high_priority" | "ignore" | "into")) {
+            while matches!(
+                word(toks.get(i)),
+                Some("low_priority" | "delayed" | "high_priority" | "ignore" | "into")
+            ) {
                 i += 1;
             }
             c.table = table_ref(&toks, &mut i);
@@ -444,10 +487,14 @@ pub fn classify(sql: &[u8]) -> Classified {
 
 /// All `column = value` candidates of an INSERT, for the router to match
 /// against the real primary key name.
+#[must_use]
 pub fn insert_candidates(sql: &[u8]) -> Vec<(String, Value)> {
     let toks = tokenize(sql, 4096);
     let mut i = 1;
-    while matches!(word(toks.get(i)), Some("low_priority" | "delayed" | "high_priority" | "ignore" | "into")) {
+    while matches!(
+        word(toks.get(i)),
+        Some("low_priority" | "delayed" | "high_priority" | "ignore" | "into")
+    ) {
         i += 1;
     }
     if table_ref(&toks, &mut i).is_none() {
@@ -460,6 +507,7 @@ pub fn insert_candidates(sql: &[u8]) -> Vec<(String, Value)> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::unnecessary_wraps)] // Compared with `Classified::table`.
     fn t(db: Option<&str>, name: &str) -> Option<(Option<String>, String)> {
         Some((db.map(str::to_owned), name.to_owned()))
     }
@@ -469,24 +517,54 @@ mod tests {
         let c = classify(b"SELECT c FROM sbtest7 WHERE id=?");
         assert_eq!(c.kind, Kind::Select);
         assert_eq!(c.table, t(None, "sbtest7"));
-        assert_eq!(c.point, Some(Point { column: "id".into(), value: Value::Param(0) }));
+        assert_eq!(
+            c.point,
+            Some(Point {
+                column: "id".into(),
+                value: Value::Param(0)
+            })
+        );
         assert!(!c.dirty);
 
         let c = classify(b"UPDATE sbtest3 SET k=k+1 WHERE id=?");
         assert_eq!(c.table, t(None, "sbtest3"));
-        assert_eq!(c.point, Some(Point { column: "id".into(), value: Value::Param(0) }));
+        assert_eq!(
+            c.point,
+            Some(Point {
+                column: "id".into(),
+                value: Value::Param(0)
+            })
+        );
 
         let c = classify(b"UPDATE sbtest3 SET c=? WHERE id=?");
-        assert_eq!(c.point, Some(Point { column: "id".into(), value: Value::Param(1) }));
+        assert_eq!(
+            c.point,
+            Some(Point {
+                column: "id".into(),
+                value: Value::Param(1)
+            })
+        );
 
         let c = classify(b"DELETE FROM `test`.`sbtest2` WHERE id = 42");
         assert_eq!(c.table, t(Some("test"), "sbtest2"));
-        assert_eq!(c.point, Some(Point { column: "id".into(), value: Value::Literal(42) }));
+        assert_eq!(
+            c.point,
+            Some(Point {
+                column: "id".into(),
+                value: Value::Literal(42)
+            })
+        );
 
         let c = classify(b"INSERT INTO sbtest9 (id, k, c, pad) VALUES (?, ?, ?, ?)");
         assert_eq!(c.kind, Kind::Insert);
         assert_eq!(c.table, t(None, "sbtest9"));
-        assert_eq!(c.point, Some(Point { column: "id".into(), value: Value::Param(0) }));
+        assert_eq!(
+            c.point,
+            Some(Point {
+                column: "id".into(),
+                value: Value::Param(0)
+            })
+        );
 
         let c = classify(b"SELECT id, k, c, pad FROM sbtest1 WHERE k IN (?, ?, ?)");
         assert_eq!(c.table, t(None, "sbtest1"));
