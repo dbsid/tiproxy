@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -97,14 +97,99 @@ pub struct Counters {
     pub route_default: AtomicU64,
     /// Backend switches to a connection that was already in sync.
     pub switch_warm: AtomicU64,
-    /// Switches that had to migrate the session to a new connection.
+    /// Switches to an open connection that only needed pipelined catch-up
+    /// statements (`DO LAST_INSERT_ID(n)`), no extra round trip.
+    pub switch_delta: AtomicU64,
+    /// Switches that re-synchronized an open connection
+    /// (`SHOW SESSION_STATES`, then `COM_RESET_CONNECTION` + `SET SESSION_STATES`).
     pub switch_migrate: AtomicU64,
+    /// Switches that had to open and authenticate a new connection.
+    pub switch_dial: AtomicU64,
     /// Failed switches (the session stayed on its backend).
     pub switch_failed: AtomicU64,
+    /// Switches skipped because the session holds unmigratable state.
+    pub switch_pinned: AtomicU64,
+    /// Switches skipped because the statement reads the previous statement's
+    /// results (`ROW_COUNT()`, `FOUND_ROWS()`, warnings).
+    pub switch_prev_dependent: AtomicU64,
+    /// Duration of switches by kind (see `SWITCH_KINDS`).
+    pub switch_seconds: [Histogram; 4],
+    /// Round trips added on the critical path by switches.
+    pub switch_round_trips: AtomicU64,
+    /// Held `BEGIN`s sent in the same write as the next statement.
+    pub begin_pipelined: AtomicU64,
+    /// Held `BEGIN`s sent with their own round trip.
+    pub begin_waited: AtomicU64,
+    /// Prepared statements prepared on demand on a backend.
+    pub lazy_prepare: AtomicU64,
+    /// Session-state changes reported by tidb-one session tracking.
+    pub state_changed: AtomicU64,
+    /// `KILL` statements rewritten to the connection that runs the session.
+    pub kill_rewritten: AtomicU64,
+    /// Session-state verifications that matched.
+    pub verify_ok: AtomicU64,
+    /// Session-state verifications that did not match.
+    pub verify_mismatch: AtomicU64,
+    /// Open backend connections.
+    pub backend_conns: AtomicI64,
     /// Transactions whose first statement was routed.
     pub txn_routed: AtomicU64,
     /// Client connections accepted.
     pub connections: AtomicU64,
+}
+
+/// Switch kinds, index into `Counters::switch_seconds`.
+pub const SWITCH_KINDS: [&str; 4] = ["warm", "delta", "migrate", "dial"];
+
+/// A fixed-bucket latency histogram.
+#[derive(Default)]
+pub struct Histogram {
+    buckets: [AtomicU64; 12],
+    sum_us: AtomicU64,
+    count: AtomicU64,
+}
+
+const BUCKETS_US: [u64; 12] = [25, 50, 100, 200, 400, 800, 1_600, 3_200, 6_400, 12_800, 51_200, u64::MAX];
+
+impl Histogram {
+    /// Records one observation.
+    pub fn observe(&self, d: Duration) {
+        let us = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        let i = BUCKETS_US.iter().position(|&b| us <= b).unwrap_or(BUCKETS_US.len() - 1);
+        self.buckets[i].fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render(&self, out: &mut String, name: &str, label: &str) {
+        let mut acc = 0;
+        for (i, b) in BUCKETS_US.iter().enumerate() {
+            acc += self.buckets[i].load(Ordering::Relaxed);
+            let le = if *b == u64::MAX { "+Inf".to_owned() } else { format!("{}", *b as f64 / 1e6) };
+            out.push_str(&format!("{name}_bucket{{{label},le=\"{le}\"}} {acc}\n"));
+        }
+        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1e6;
+        out.push_str(&format!("{name}_sum{{{label}}} {sum}\n"));
+        out.push_str(&format!("{name}_count{{{label}}} {}\n", self.count.load(Ordering::Relaxed)));
+    }
+}
+
+/// Session behavior switches, from the command line.
+#[derive(Debug, Clone)]
+pub struct SessionOptions {
+    /// Enable tidb-one session tracking on backend connections.
+    pub session_track: bool,
+    /// Send a held option-less `BEGIN` in the same write as the next statement.
+    pub pipeline_begin: bool,
+    /// After every switch, compare `SHOW SESSION_STATES` of the old and the new
+    /// connection (testing only; adds round trips).
+    pub verify_session_states: bool,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self { session_track: true, pipeline_begin: true, verify_session_states: false }
+    }
 }
 
 /// Shared routing table.
@@ -116,12 +201,19 @@ pub struct Router {
     rr: AtomicUsize,
     /// Counters exported on the status port.
     pub counters: Counters,
+    /// Session behavior.
+    pub options: SessionOptions,
 }
 
 impl Router {
     /// Creates a router that discovers backends through the TiDB status
     /// addresses `seeds` and Regions through PD.
     pub fn new(seeds: Vec<String>, pd: Vec<String>) -> Arc<Self> {
+        Self::with_options(seeds, pd, SessionOptions::default())
+    }
+
+    /// Like `new`, with explicit session options.
+    pub fn with_options(seeds: Vec<String>, pd: Vec<String>, options: SessionOptions) -> Arc<Self> {
         Arc::new(Self {
             seeds,
             pd,
@@ -129,6 +221,7 @@ impl Router {
             wanted: RwLock::new(HashSet::new()),
             rr: AtomicUsize::new(0),
             counters: Counters::default(),
+            options,
         })
     }
 
@@ -330,10 +423,26 @@ impl Router {
         put("route_total", "{reason=\"table\"}", &c.route_table);
         put("route_total", "{reason=\"default\"}", &c.route_default);
         put("switch_total", "{kind=\"warm\"}", &c.switch_warm);
+        put("switch_total", "{kind=\"delta\"}", &c.switch_delta);
         put("switch_total", "{kind=\"migrate\"}", &c.switch_migrate);
+        put("switch_total", "{kind=\"dial\"}", &c.switch_dial);
         put("switch_total", "{kind=\"failed\"}", &c.switch_failed);
+        put("switch_skipped_total", "{reason=\"unmigratable\"}", &c.switch_pinned);
+        put("switch_skipped_total", "{reason=\"prev_dependent\"}", &c.switch_prev_dependent);
+        put("switch_round_trips_total", "", &c.switch_round_trips);
+        put("begin_total", "{mode=\"pipelined\"}", &c.begin_pipelined);
+        put("begin_total", "{mode=\"waited\"}", &c.begin_waited);
+        put("lazy_prepare_total", "", &c.lazy_prepare);
+        put("state_changed_total", "", &c.state_changed);
+        put("kill_rewritten_total", "", &c.kill_rewritten);
+        put("verify_total", "{result=\"ok\"}", &c.verify_ok);
+        put("verify_total", "{result=\"mismatch\"}", &c.verify_mismatch);
         put("txn_routed_total", "", &c.txn_routed);
         put("connections_total", "", &c.connections);
+        s.push_str(&format!("tiproxy_locality_backend_conns {}\n", c.backend_conns.load(Ordering::Relaxed)));
+        for (i, kind) in SWITCH_KINDS.iter().enumerate() {
+            c.switch_seconds[i].render(&mut s, "tiproxy_locality_switch_seconds", &format!("kind=\"{kind}\""));
+        }
         if let Ok(st) = self.state.read() {
             for b in &st.backends {
                 s.push_str(&format!(
