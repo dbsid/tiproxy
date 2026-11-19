@@ -1,7 +1,7 @@
 // Copyright 2026 PingCAP, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! MySQL packet framing and the handful of protocol messages the router reads
+//! `MySQL` packet framing and the handful of protocol messages the router reads
 //! or writes itself. Everything else is relayed unchanged.
 
 use std::io;
@@ -62,7 +62,8 @@ pub mod status {
     /// packet carries the value in its last-insert-id field.
     pub const TIDB_ONE_LAST_INSERT_ID: u16 = 0x8000;
     /// All tidb-one tracking bits, removed before packets reach the client.
-    pub const TIDB_ONE_MASK: u16 = TIDB_ONE_UNMIGRATABLE | SESSION_STATE_CHANGED | TIDB_ONE_LAST_INSERT_ID;
+    pub const TIDB_ONE_MASK: u16 =
+        TIDB_ONE_UNMIGRATABLE | SESSION_STATE_CHANGED | TIDB_ONE_LAST_INSERT_ID;
 }
 
 /// Command bytes used by the router.
@@ -105,7 +106,7 @@ fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_owned())
 }
 
-/// One side of a MySQL connection with buffered, sequence-tracked framing.
+/// One side of a `MySQL` connection with buffered, sequence-tracked framing.
 pub struct PacketConn {
     reader: BufReader<OwnedReadHalf>,
     writer: BufWriter<OwnedWriteHalf>,
@@ -132,6 +133,10 @@ impl PacketConn {
     }
 
     /// Reads one logical packet and returns its payload.
+    ///
+    /// # Errors
+    ///
+    /// Read errors, or a logical packet larger than `MAX_LOGICAL`.
     pub async fn read(&mut self) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
@@ -146,6 +151,10 @@ impl PacketConn {
     }
 
     /// Queues one logical packet; call [`PacketConn::flush`] to send.
+    ///
+    /// # Errors
+    ///
+    /// Write errors.
     pub async fn write(&mut self, payload: &[u8]) -> io::Result<()> {
         let mut rest = payload;
         loop {
@@ -168,11 +177,19 @@ impl PacketConn {
     }
 
     /// Flushes queued packets.
+    ///
+    /// # Errors
+    ///
+    /// Write errors.
     pub async fn flush(&mut self) -> io::Result<()> {
         self.writer.flush().await
     }
 
     /// Writes one packet and flushes.
+    ///
+    /// # Errors
+    ///
+    /// Write errors.
     pub async fn send(&mut self, payload: &[u8]) -> io::Result<()> {
         self.write(payload).await?;
         self.flush().await
@@ -201,6 +218,10 @@ async fn read_physical<R: AsyncRead + Unpin>(
 }
 
 /// Writes all bytes to an async writer (used for raw relays).
+///
+/// # Errors
+///
+/// Write errors.
 pub async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, b: &[u8]) -> io::Result<()> {
     w.write_all(b).await
 }
@@ -235,14 +256,15 @@ pub fn lenenc_bytes<'a>(b: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
 
 /// Appends a length-encoded integer.
 pub fn put_lenenc_int(out: &mut Vec<u8>, v: u64) {
+    let b = v.to_le_bytes();
     if v < 251 {
-        out.push(v as u8);
+        out.push(b[0]);
     } else if v < 1 << 16 {
         out.push(0xfc);
-        out.extend_from_slice(&(v as u16).to_le_bytes());
+        out.extend_from_slice(&b[..2]);
     } else if v < 1 << 24 {
         out.push(0xfd);
-        out.extend_from_slice(&(v as u32).to_le_bytes()[..3]);
+        out.extend_from_slice(&b[..3]);
     } else {
         out.push(0xfe);
         out.extend_from_slice(&v.to_le_bytes());
@@ -273,6 +295,7 @@ pub enum PacketKind {
 }
 
 /// Classifies a response packet.
+#[must_use]
 pub fn kind(p: &[u8]) -> PacketKind {
     match p.first() {
         Some(0x00) if p.len() >= 7 => PacketKind::Ok,
@@ -284,6 +307,7 @@ pub fn kind(p: &[u8]) -> PacketKind {
 }
 
 /// Status flags of an OK packet (header 0x00 or 0xfe).
+#[must_use]
 pub fn ok_status(p: &[u8]) -> Option<u16> {
     let mut pos = 1;
     lenenc_int(p, &mut pos)?;
@@ -293,6 +317,7 @@ pub fn ok_status(p: &[u8]) -> Option<u16> {
 }
 
 /// Status flags of a terminator: classic EOF, or OK-as-EOF under `DEPRECATE_EOF`.
+#[must_use]
 pub fn eof_status(p: &[u8], deprecate_eof: bool) -> Option<u16> {
     if deprecate_eof {
         ok_status(p)
@@ -311,6 +336,7 @@ fn ok_status_at(p: &[u8]) -> Option<usize> {
 }
 
 /// The last-insert-id field of an OK packet (header 0x00 or 0xfe).
+#[must_use]
 pub fn ok_last_insert_id(p: &[u8]) -> Option<u64> {
     let mut pos = 1;
     lenenc_int(p, &mut pos)?;
@@ -320,18 +346,24 @@ pub fn ok_last_insert_id(p: &[u8]) -> Option<u64> {
 /// Rewrites the status flags of an OK packet, or of an EOF packet when
 /// `ok_form` is false, in place.
 pub fn set_terminator_status(p: &mut [u8], ok_form: bool, status: u16) {
-    let at = if ok_form { ok_status_at(p) } else { (p.len() >= 5).then_some(3) };
+    let at = if ok_form {
+        ok_status_at(p)
+    } else {
+        (p.len() >= 5).then_some(3)
+    };
     if let Some(at) = at {
         p[at..at + 2].copy_from_slice(&status.to_le_bytes());
     }
 }
 
 /// Builds an OK packet.
+#[must_use]
 pub fn ok_packet(status: u16) -> Vec<u8> {
     vec![0x00, 0, 0, (status & 0xff) as u8, (status >> 8) as u8, 0, 0]
 }
 
 /// Builds an ERR packet.
+#[must_use]
 pub fn err_packet(code: u16, state: &[u8; 5], msg: &str) -> Vec<u8> {
     let mut p = Vec::with_capacity(9 + msg.len());
     p.push(0xff);
@@ -358,6 +390,7 @@ pub struct Greeting {
 
 impl Greeting {
     /// Parses a server greeting.
+    #[must_use]
     pub fn parse(p: &[u8]) -> Option<Self> {
         if *p.first()? != 10 {
             return None;
@@ -373,7 +406,13 @@ impl Greeting {
         let low = u32::from(u16::from_le_bytes([*p.get(pos)?, *p.get(pos + 1)?]));
         pos += 2;
         if pos >= p.len() {
-            return Some(Self { capabilities: low, salt, conn_id, cap_low_at, cap_high_at: None });
+            return Some(Self {
+                capabilities: low,
+                salt,
+                conn_id,
+                cap_low_at,
+                cap_high_at: None,
+            });
         }
         pos += 3; // charset + status
         let cap_high_at = pos;
@@ -389,7 +428,13 @@ impl Greeting {
                 salt.extend_from_slice(part2);
             }
         }
-        Some(Self { capabilities, salt, conn_id, cap_low_at, cap_high_at: Some(cap_high_at) })
+        Some(Self {
+            capabilities,
+            salt,
+            conn_id,
+            cap_low_at,
+            cap_high_at: Some(cap_high_at),
+        })
     }
 
     /// Rewrites the capability flags of the greeting packet `p` in place.
@@ -438,16 +483,29 @@ impl HandshakeResponse {
             nul_str(p, &mut pos)?;
         }
         let db = if caps & cap::CONNECT_WITH_DB != 0 {
-            nul_str(p, &mut pos).map(<[u8]>::to_vec).filter(|d| !d.is_empty())
+            nul_str(p, &mut pos)
+                .map(<[u8]>::to_vec)
+                .filter(|d| !d.is_empty())
         } else {
             None
         };
-        Some(Self { capabilities: caps, max_packet, collation, user, db })
+        Some(Self {
+            capabilities: caps,
+            max_packet,
+            collation,
+            user,
+            db,
+        })
     }
 
     /// Encodes a response that authenticates with `plugin` and `auth`.
+    #[must_use]
     pub fn encode(&self, caps: u32, plugin: &str, auth: &[u8], db: Option<&[u8]>) -> Vec<u8> {
-        let mut caps = caps | cap::PROTOCOL_41 | cap::SECURE_CONNECTION | cap::PLUGIN_AUTH | cap::PLUGIN_AUTH_LENENC;
+        let mut caps = caps
+            | cap::PROTOCOL_41
+            | cap::SECURE_CONNECTION
+            | cap::PLUGIN_AUTH
+            | cap::PLUGIN_AUTH_LENENC;
         caps &= !(cap::SSL | cap::COMPRESS | cap::ZSTD | cap::CONNECT_ATTRS);
         if db.is_some() {
             caps |= cap::CONNECT_WITH_DB;
@@ -479,7 +537,16 @@ mod tests {
 
     #[test]
     fn lenenc_roundtrip() {
-        for v in [0u64, 250, 251, 65535, 65536, (1 << 24) - 1, 1 << 24, u64::MAX] {
+        for v in [
+            0u64,
+            250,
+            251,
+            65535,
+            65536,
+            (1 << 24) - 1,
+            1 << 24,
+            u64::MAX,
+        ] {
             let mut b = Vec::new();
             put_lenenc_int(&mut b, v);
             let mut pos = 0;
@@ -497,7 +564,12 @@ mod tests {
             user: b"root".to_vec(),
             db: None,
         };
-        let p = base.encode(cap::PROTOCOL_41 | cap::DEPRECATE_EOF, "tidb_session_token", b"tok", Some(b"test"));
+        let p = base.encode(
+            cap::PROTOCOL_41 | cap::DEPRECATE_EOF,
+            "tidb_session_token",
+            b"tok",
+            Some(b"test"),
+        );
         let parsed = HandshakeResponse::parse(&p).unwrap_or_default();
         assert_eq!(parsed.user, b"root");
         assert_eq!(parsed.db.as_deref(), Some(&b"test"[..]));

@@ -1,14 +1,18 @@
 // Copyright 2026 PingCAP, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! TiDB key encoding needed to find the Region of a row.
+//! `TiDB` key encoding needed to find the Region of a row.
 
-/// Encodes an `i64` in TiDB's memcomparable form (sign bit flipped, big endian).
+use std::fmt::Write as _;
+
+/// Encodes an `i64` in `TiDB`'s memcomparable form (sign bit flipped, big endian).
+#[must_use]
 pub fn encode_i64(v: i64) -> [u8; 8] {
-    ((v as u64) ^ (1u64 << 63)).to_be_bytes()
+    (v.cast_unsigned() ^ (1u64 << 63)).to_be_bytes()
 }
 
 /// Raw record key `t{table_id}_r{handle}` for an integer handle.
+#[must_use]
 pub fn record_key(table_id: i64, handle: i64) -> Vec<u8> {
     let mut k = Vec::with_capacity(19);
     k.push(b't');
@@ -19,6 +23,7 @@ pub fn record_key(table_id: i64, handle: i64) -> Vec<u8> {
 }
 
 /// Raw record-range prefix `t{table_id}_r`.
+#[must_use]
 pub fn record_prefix(table_id: i64) -> Vec<u8> {
     let mut k = Vec::with_capacity(11);
     k.push(b't');
@@ -28,6 +33,7 @@ pub fn record_prefix(table_id: i64) -> Vec<u8> {
 }
 
 /// Raw key just after the record range of `table_id` (`t{table_id}_s`).
+#[must_use]
 pub fn record_end(table_id: i64) -> Vec<u8> {
     let mut k = Vec::with_capacity(11);
     k.push(b't');
@@ -37,6 +43,7 @@ pub fn record_end(table_id: i64) -> Vec<u8> {
 }
 
 /// Raw key just after every key of `table_id` (`t{table_id+1}`).
+#[must_use]
 pub fn table_end(table_id: i64) -> Vec<u8> {
     let mut k = Vec::with_capacity(9);
     k.push(b't');
@@ -45,6 +52,7 @@ pub fn table_end(table_id: i64) -> Vec<u8> {
 }
 
 /// Raw table prefix `t{table_id}`.
+#[must_use]
 pub fn table_prefix(table_id: i64) -> Vec<u8> {
     let mut k = Vec::with_capacity(9);
     k.push(b't');
@@ -52,9 +60,10 @@ pub fn table_prefix(table_id: i64) -> Vec<u8> {
     k
 }
 
-/// Memcomparable bytes encoding used for TiKV transactional keys
+/// Memcomparable bytes encoding used for `TiKV` transactional keys
 /// (`codec.EncodeBytes`): 8-byte groups, each followed by `0xFF - padding`.
 /// Region boundaries in PD are stored in this form.
+#[must_use]
 pub fn encode_bytes(raw: &[u8]) -> Vec<u8> {
     const GROUP: usize = 8;
     let mut out = Vec::with_capacity((raw.len() / GROUP + 1) * (GROUP + 1));
@@ -69,13 +78,14 @@ pub fn encode_bytes(raw: &[u8]) -> Vec<u8> {
             out.extend_from_slice(&raw[i..]);
             let pad = GROUP - remain;
             out.extend(std::iter::repeat_n(0u8, pad));
-            out.push(0xff - pad as u8);
+            out.push(0xff - u8::try_from(pad).unwrap_or(0));
             return out;
         }
     }
 }
 
 /// Parses an upper- or lower-case hex string.
+#[must_use]
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
@@ -87,13 +97,14 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Percent-encodes bytes for a URL query value.
+#[must_use]
 pub fn url_escape(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 3);
     for &c in b {
         if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'~') {
             s.push(char::from(c));
         } else {
-            s.push_str(&format!("%{c:02X}"));
+            let _ = write!(s, "%{c:02X}");
         }
     }
     s

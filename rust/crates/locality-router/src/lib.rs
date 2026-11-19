@@ -3,7 +3,7 @@
 
 //! Transaction-level locality routing for tidb-one.
 //!
-//! In tidb-one every SQL backend is a TiDB process that embeds a TiKV store.
+//! In tidb-one every SQL backend is a `TiDB` process that embeds a `TiKV` store.
 //! A transaction whose keys are led by that store runs entirely in process
 //! (local KV calls, and 1PC when the keys share one Region, as with table
 //! affinity). This dataplane mode sends each transaction to the backend that
@@ -38,11 +38,11 @@ pub use router::{Router, SessionOptions};
 /// Command-line options of the locality router.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// MySQL listen address.
+    /// `MySQL` listen address.
     pub listen: String,
     /// HTTP status/metrics listen address.
     pub status: Option<String>,
-    /// TiDB status addresses used to discover backends.
+    /// `TiDB` status addresses used to discover backends.
     pub tidb_status: Vec<String>,
     /// PD client addresses.
     pub pd: Vec<String>,
@@ -53,6 +53,10 @@ pub struct Options {
 }
 
 /// Parses `--flag value` pairs.
+///
+/// # Errors
+///
+/// An unknown flag, a missing or invalid value, or missing required flags.
 pub fn parse_options<I: Iterator<Item = String>>(mut args: I) -> Result<Options, String> {
     let mut o = Options {
         listen: "0.0.0.0:6000".to_owned(),
@@ -62,7 +66,12 @@ pub fn parse_options<I: Iterator<Item = String>>(mut args: I) -> Result<Options,
         refresh: Duration::from_secs(1),
         session: SessionOptions::default(),
     };
-    let list = |v: String| v.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+    let list = |v: String| {
+        v.split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -87,6 +96,10 @@ pub fn parse_options<I: Iterator<Item = String>>(mut args: I) -> Result<Options,
 }
 
 /// Runs the router until the process exits.
+///
+/// # Errors
+///
+/// Failing to bind the listen or status address, or to accept connections.
 pub async fn run(o: Options) -> io::Result<()> {
     let router = Router::with_options(o.tidb_status.clone(), o.pd.clone(), o.session.clone());
     tokio::spawn(Arc::clone(&router).refresh_loop(o.refresh));
@@ -102,7 +115,11 @@ pub async fn run(o: Options) -> io::Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let listener = TcpListener::bind(&o.listen).await?;
-    eprintln!("locality-router: listening on {}, backends {:?}", o.listen, router.backends());
+    eprintln!(
+        "locality-router: listening on {}, backends {:?}",
+        o.listen,
+        router.backends()
+    );
     loop {
         let (client, peer) = listener.accept().await?;
         let router = Arc::clone(&router);
@@ -129,7 +146,9 @@ pub async fn run(o: Options) -> io::Result<()> {
 
 async fn serve_status(listener: TcpListener, router: Arc<Router>) {
     loop {
-        let Ok((mut s, _)) = listener.accept().await else { continue };
+        let Ok((mut s, _)) = listener.accept().await else {
+            continue;
+        };
         let router = Arc::clone(&router);
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];

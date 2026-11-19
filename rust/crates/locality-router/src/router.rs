@@ -5,9 +5,9 @@
 //! table or row.
 //!
 //! Sources, refreshed in the background:
-//! * TiDB `/info/all`: SQL backends and their `tidb_one_store_id` label (the
-//!   TiKV store embedded in the same process);
-//! * TiDB `/schema/{db}/{table}`: table ID, integer-handle column, hash
+//! * `TiDB` `/info/all`: SQL backends and their `tidb_one_store_id` label (the
+//!   `TiKV` store embedded in the same process);
+//! * `TiDB` `/schema/{db}/{table}`: table ID, integer-handle column, hash
 //!   partitions;
 //! * PD `/pd/api/v1/regions/key`: Regions and leaders of each physical table's
 //!   key range.
@@ -16,6 +16,7 @@
 //! falls back to the current backend.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -28,7 +29,7 @@ use tokio::time::timeout;
 
 use crate::keycodec;
 
-/// Label that carries the ID of the TiKV store embedded in a tidb-one server.
+/// Label that carries the ID of the `TiKV` store embedded in a tidb-one server.
 pub const STORE_ID_LABEL: &str = "tidb_one_store_id";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -37,7 +38,7 @@ const TABLE_META_TTL: Duration = Duration::from_secs(30);
 /// One SQL backend.
 #[derive(Debug, Clone)]
 pub struct Backend {
-    /// MySQL protocol address.
+    /// `MySQL` protocol address.
     pub sql_addr: String,
     /// HTTP status address.
     pub status_addr: String,
@@ -149,13 +150,29 @@ pub struct Histogram {
     count: AtomicU64,
 }
 
-const BUCKETS_US: [u64; 12] = [25, 50, 100, 200, 400, 800, 1_600, 3_200, 6_400, 12_800, 51_200, u64::MAX];
+const BUCKETS_US: [u64; 12] = [
+    25,
+    50,
+    100,
+    200,
+    400,
+    800,
+    1_600,
+    3_200,
+    6_400,
+    12_800,
+    51_200,
+    u64::MAX,
+];
 
 impl Histogram {
     /// Records one observation.
     pub fn observe(&self, d: Duration) {
         let us = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-        let i = BUCKETS_US.iter().position(|&b| us <= b).unwrap_or(BUCKETS_US.len() - 1);
+        let i = BUCKETS_US
+            .iter()
+            .position(|&b| us <= b)
+            .unwrap_or(BUCKETS_US.len() - 1);
         self.buckets[i].fetch_add(1, Ordering::Relaxed);
         self.sum_us.fetch_add(us, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -165,12 +182,20 @@ impl Histogram {
         let mut acc = 0;
         for (i, b) in BUCKETS_US.iter().enumerate() {
             acc += self.buckets[i].load(Ordering::Relaxed);
-            let le = if *b == u64::MAX { "+Inf".to_owned() } else { format!("{}", *b as f64 / 1e6) };
-            out.push_str(&format!("{name}_bucket{{{label},le=\"{le}\"}} {acc}\n"));
+            let le = if *b == u64::MAX {
+                "+Inf".to_owned()
+            } else {
+                format!("{}", Duration::from_micros(*b).as_secs_f64())
+            };
+            let _ = writeln!(out, "{name}_bucket{{{label},le=\"{le}\"}} {acc}");
         }
-        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1e6;
-        out.push_str(&format!("{name}_sum{{{label}}} {sum}\n"));
-        out.push_str(&format!("{name}_count{{{label}}} {}\n", self.count.load(Ordering::Relaxed)));
+        let sum = Duration::from_micros(self.sum_us.load(Ordering::Relaxed)).as_secs_f64();
+        let _ = writeln!(out, "{name}_sum{{{label}}} {sum}");
+        let _ = writeln!(
+            out,
+            "{name}_count{{{label}}} {}",
+            self.count.load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -188,7 +213,11 @@ pub struct SessionOptions {
 
 impl Default for SessionOptions {
     fn default() -> Self {
-        Self { session_track: true, pipeline_begin: true, verify_session_states: false }
+        Self {
+            session_track: true,
+            pipeline_begin: true,
+            verify_session_states: false,
+        }
     }
 }
 
@@ -206,13 +235,15 @@ pub struct Router {
 }
 
 impl Router {
-    /// Creates a router that discovers backends through the TiDB status
+    /// Creates a router that discovers backends through the `TiDB` status
     /// addresses `seeds` and Regions through PD.
+    #[must_use]
     pub fn new(seeds: Vec<String>, pd: Vec<String>) -> Arc<Self> {
         Self::with_options(seeds, pd, SessionOptions::default())
     }
 
     /// Like `new`, with explicit session options.
+    #[must_use]
     pub fn with_options(seeds: Vec<String>, pd: Vec<String>, options: SessionOptions) -> Arc<Self> {
         Arc::new(Self {
             seeds,
@@ -227,7 +258,10 @@ impl Router {
 
     /// Current backends.
     pub fn backends(&self) -> Vec<Backend> {
-        self.state.read().map(|s| s.backends.clone()).unwrap_or_default()
+        self.state
+            .read()
+            .map(|s| s.backends.clone())
+            .unwrap_or_default()
     }
 
     /// Picks the backend of a new connection (round robin).
@@ -242,7 +276,12 @@ impl Router {
 
     /// Finds the backend next to the leader of the row `handle` of `db.table`,
     /// or of the whole table when it has a single leader.
-    pub fn locate(&self, db: &str, table: &str, point: Option<(&str, i64)>) -> (Option<String>, Reason) {
+    pub fn locate(
+        &self,
+        db: &str,
+        table: &str,
+        point: Option<(&str, i64)>,
+    ) -> (Option<String>, Reason) {
         let key = (db.to_owned(), table.to_owned());
         let Ok(state) = self.state.read() else {
             return (None, Reason::Default);
@@ -262,8 +301,10 @@ impl Router {
         {
             let physical = if route.physicals.len() > 1 {
                 if route.hash_partition_col.as_deref() == Some(col) {
-                    let n = route.physicals.len() as i64;
-                    route.physicals.get(usize::try_from((handle % n).abs()).unwrap_or(0))
+                    let n = i64::try_from(route.physicals.len()).unwrap_or(i64::MAX);
+                    route
+                        .physicals
+                        .get(usize::try_from((handle % n).abs()).unwrap_or(0))
                 } else {
                     None
                 }
@@ -272,7 +313,11 @@ impl Router {
             };
             if let Some(p) = physical {
                 let k = keycodec::encode_bytes(&keycodec::record_key(p.id, handle));
-                if let Some(r) = p.regions.iter().find(|r| r.start <= k && (r.end.is_empty() || k < r.end)) {
+                if let Some(r) = p
+                    .regions
+                    .iter()
+                    .find(|r| r.start <= k && (r.end.is_empty() || k < r.end))
+                {
                     store = r.leader_store;
                     reason = Reason::Point;
                 }
@@ -283,7 +328,13 @@ impl Router {
             reason = Reason::Table;
         }
         let addr = (store != 0)
-            .then(|| state.backends.iter().find(|b| b.store_id == store).map(|b| b.sql_addr.clone()))
+            .then(|| {
+                state
+                    .backends
+                    .iter()
+                    .find(|b| b.store_id == store)
+                    .map(|b| b.sql_addr.clone())
+            })
             .flatten();
         let counter = match (addr.is_some(), reason) {
             (true, Reason::Point) => &self.counters.route_point,
@@ -352,7 +403,10 @@ impl Router {
         if let Some(all) = info.get("all_servers_info").and_then(Json::as_object) {
             for s in all.values() {
                 let ip = s.get("ip").and_then(Json::as_str).unwrap_or("127.0.0.1");
-                let port = s.get("listening_port").and_then(Json::as_u64).unwrap_or(4000);
+                let port = s
+                    .get("listening_port")
+                    .and_then(Json::as_u64)
+                    .unwrap_or(4000);
                 let status = s.get("status_port").and_then(Json::as_u64).unwrap_or(10080);
                 let store_id = s
                     .get("labels")
@@ -379,7 +433,11 @@ impl Router {
 
     async fn refresh_table(&self, db: &str, table: &str) -> io::Result<()> {
         let key = (db.to_owned(), table.to_owned());
-        let cached = self.state.read().ok().and_then(|s| s.tables.get(&key).cloned());
+        let cached = self
+            .state
+            .read()
+            .ok()
+            .and_then(|s| s.tables.get(&key).cloned());
         let (handle_col, hash_col, ids, meta_at) = match cached {
             Some(r) if r.meta_at.elapsed() < TABLE_META_TTL => (
                 r.handle_col,
@@ -398,14 +456,31 @@ impl Router {
             let start = keycodec::url_escape(&keycodec::encode_bytes(&keycodec::table_prefix(id)));
             let end = keycodec::url_escape(&keycodec::encode_bytes(&keycodec::table_end(id)));
             let v = self
-                .pd_get(&format!("/pd/api/v1/regions/key?key={start}&end_key={end}&limit=4096"))
+                .pd_get(&format!(
+                    "/pd/api/v1/regions/key?key={start}&end_key={end}&limit=4096"
+                ))
                 .await?;
-            physicals.push(Physical { id, regions: parse_regions(&v) });
+            physicals.push(Physical {
+                id,
+                regions: parse_regions(&v),
+            });
         }
-        let mut leaders = physicals.iter().flat_map(|p| p.regions.iter().map(|r| r.leader_store));
+        let mut leaders = physicals
+            .iter()
+            .flat_map(|p| p.regions.iter().map(|r| r.leader_store));
         let first = leaders.next().unwrap_or(0);
-        let table_leader = if first != 0 && leaders.all(|l| l == first) { first } else { 0 };
-        let route = TableRoute { handle_col, hash_partition_col: hash_col, physicals, table_leader, meta_at };
+        let table_leader = if first != 0 && leaders.all(|l| l == first) {
+            first
+        } else {
+            0
+        };
+        let route = TableRoute {
+            handle_col,
+            hash_partition_col: hash_col,
+            physicals,
+            table_leader,
+            meta_at,
+        };
         if let Ok(mut s) = self.state.write() {
             s.tables.insert(key, route);
         }
@@ -417,7 +492,11 @@ impl Router {
         let c = &self.counters;
         let mut s = String::new();
         let mut put = |name: &str, label: &str, v: &AtomicU64| {
-            s.push_str(&format!("tiproxy_locality_{name}{label} {}\n", v.load(Ordering::Relaxed)));
+            let _ = writeln!(
+                s,
+                "tiproxy_locality_{name}{label} {}",
+                v.load(Ordering::Relaxed)
+            );
         };
         put("route_total", "{reason=\"point\"}", &c.route_point);
         put("route_total", "{reason=\"table\"}", &c.route_table);
@@ -427,8 +506,16 @@ impl Router {
         put("switch_total", "{kind=\"migrate\"}", &c.switch_migrate);
         put("switch_total", "{kind=\"dial\"}", &c.switch_dial);
         put("switch_total", "{kind=\"failed\"}", &c.switch_failed);
-        put("switch_skipped_total", "{reason=\"unmigratable\"}", &c.switch_pinned);
-        put("switch_skipped_total", "{reason=\"prev_dependent\"}", &c.switch_prev_dependent);
+        put(
+            "switch_skipped_total",
+            "{reason=\"unmigratable\"}",
+            &c.switch_pinned,
+        );
+        put(
+            "switch_skipped_total",
+            "{reason=\"prev_dependent\"}",
+            &c.switch_prev_dependent,
+        );
         put("switch_round_trips_total", "", &c.switch_round_trips);
         put("begin_total", "{mode=\"pipelined\"}", &c.begin_pipelined);
         put("begin_total", "{mode=\"waited\"}", &c.begin_waited);
@@ -439,22 +526,32 @@ impl Router {
         put("verify_total", "{result=\"mismatch\"}", &c.verify_mismatch);
         put("txn_routed_total", "", &c.txn_routed);
         put("connections_total", "", &c.connections);
-        s.push_str(&format!("tiproxy_locality_backend_conns {}\n", c.backend_conns.load(Ordering::Relaxed)));
+        let _ = writeln!(
+            s,
+            "tiproxy_locality_backend_conns {}",
+            c.backend_conns.load(Ordering::Relaxed)
+        );
         for (i, kind) in SWITCH_KINDS.iter().enumerate() {
-            c.switch_seconds[i].render(&mut s, "tiproxy_locality_switch_seconds", &format!("kind=\"{kind}\""));
+            c.switch_seconds[i].render(
+                &mut s,
+                "tiproxy_locality_switch_seconds",
+                &format!("kind=\"{kind}\""),
+            );
         }
         if let Ok(st) = self.state.read() {
             for b in &st.backends {
-                s.push_str(&format!(
-                    "tiproxy_locality_backend{{addr=\"{}\",store_id=\"{}\"}} 1\n",
+                let _ = writeln!(
+                    s,
+                    "tiproxy_locality_backend{{addr=\"{}\",store_id=\"{}\"}} 1",
                     b.sql_addr, b.store_id
-                ));
+                );
             }
             for ((db, t), r) in &st.tables {
-                s.push_str(&format!(
-                    "tiproxy_locality_table_leader{{db=\"{db}\",table=\"{t}\"}} {}\n",
+                let _ = writeln!(
+                    s,
+                    "tiproxy_locality_table_leader{{db=\"{db}\",table=\"{t}\"}} {}",
                     r.table_leader
-                ));
+                );
             }
         }
         s
@@ -464,15 +561,26 @@ impl Router {
 type TableMeta = (Option<String>, Option<String>, Vec<i64>);
 
 fn parse_table_meta(meta: &Json) -> io::Result<TableMeta> {
-    let id = meta.get("id").and_then(Json::as_i64).ok_or_else(|| io::Error::other("table id missing"))?;
+    let id = meta
+        .get("id")
+        .and_then(Json::as_i64)
+        .ok_or_else(|| io::Error::other("table id missing"))?;
     let mut handle = None;
     if meta.get("pk_is_handle").and_then(Json::as_bool) == Some(true)
         && let Some(cols) = meta.get("cols").and_then(Json::as_array)
     {
         for c in cols {
-            let flag = c.get("type").and_then(|t| t.get("Flag")).and_then(Json::as_u64).unwrap_or(0);
+            let flag = c
+                .get("type")
+                .and_then(|t| t.get("Flag"))
+                .and_then(Json::as_u64)
+                .unwrap_or(0);
             if flag & 2 != 0 {
-                handle = c.get("name").and_then(|n| n.get("L")).and_then(Json::as_str).map(str::to_owned);
+                handle = c
+                    .get("name")
+                    .and_then(|n| n.get("L"))
+                    .and_then(Json::as_str)
+                    .map(str::to_owned);
             }
         }
     }
@@ -482,7 +590,11 @@ fn parse_table_meta(meta: &Json) -> io::Result<TableMeta> {
         let defs: Vec<i64> = p
             .get("definitions")
             .and_then(Json::as_array)
-            .map(|d| d.iter().filter_map(|x| x.get("id").and_then(Json::as_i64)).collect())
+            .map(|d| {
+                d.iter()
+                    .filter_map(|x| x.get("id").and_then(Json::as_i64))
+                    .collect()
+            })
             .unwrap_or_default();
         if !defs.is_empty() {
             ids = defs;
@@ -503,10 +615,26 @@ fn parse_regions(v: &Json) -> Vec<Region> {
     let mut out = Vec::new();
     if let Some(regions) = v.get("regions").and_then(Json::as_array) {
         for r in regions {
-            let start = r.get("start_key").and_then(Json::as_str).and_then(keycodec::from_hex).unwrap_or_default();
-            let end = r.get("end_key").and_then(Json::as_str).and_then(keycodec::from_hex).unwrap_or_default();
-            let leader = r.get("leader").and_then(|l| l.get("store_id")).and_then(Json::as_u64).unwrap_or(0);
-            out.push(Region { start, end, leader_store: leader });
+            let start = r
+                .get("start_key")
+                .and_then(Json::as_str)
+                .and_then(keycodec::from_hex)
+                .unwrap_or_default();
+            let end = r
+                .get("end_key")
+                .and_then(Json::as_str)
+                .and_then(keycodec::from_hex)
+                .unwrap_or_default();
+            let leader = r
+                .get("leader")
+                .and_then(|l| l.get("store_id"))
+                .and_then(Json::as_u64)
+                .unwrap_or(0);
+            out.push(Region {
+                start,
+                end,
+                leader_store: leader,
+            });
         }
     }
     out.sort_by(|a, b| a.start.cmp(&b.start));
@@ -517,13 +645,20 @@ fn parse_regions(v: &Json) -> Vec<Region> {
 async fn http_get_json(addr: &str, path: &str) -> io::Result<Json> {
     let body = timeout(HTTP_TIMEOUT, http_get(addr, path))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("GET {addr}{path} timed out")))??;
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("GET {addr}{path} timed out"),
+            )
+        })??;
     serde_json::from_slice(&body).map_err(|e| io::Error::other(format!("GET {addr}{path}: {e}")))
 }
 
 async fn http_get(addr: &str, path: &str) -> io::Result<Vec<u8>> {
     let mut s = TcpStream::connect(addr).await?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
     s.write_all(req.as_bytes()).await?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).await?;
@@ -541,9 +676,12 @@ async fn http_get(addr: &str, path: &str) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut rest = body;
         loop {
-            let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else { break };
+            let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else {
+                break;
+            };
             let size_txt = String::from_utf8_lossy(&rest[..eol]);
-            let size = usize::from_str_radix(size_txt.split(';').next().unwrap_or("0").trim(), 16).unwrap_or(0);
+            let size = usize::from_str_radix(size_txt.split(';').next().unwrap_or("0").trim(), 16)
+                .unwrap_or(0);
             rest = &rest[eol + 2..];
             if size == 0 || rest.len() < size {
                 break;
@@ -579,8 +717,16 @@ mod tests {
         let split = keycodec::encode_bytes(&keycodec::record_key(10, 1000));
         if let Ok(mut s) = r.state.write() {
             s.backends = vec![
-                Backend { sql_addr: "a:1".into(), status_addr: String::new(), store_id: 1 },
-                Backend { sql_addr: "b:1".into(), status_addr: String::new(), store_id: 2 },
+                Backend {
+                    sql_addr: "a:1".into(),
+                    status_addr: String::new(),
+                    store_id: 1,
+                },
+                Backend {
+                    sql_addr: "b:1".into(),
+                    status_addr: String::new(),
+                    store_id: 2,
+                },
             ];
             s.tables.insert(
                 ("test".into(), "t".into()),
@@ -590,8 +736,16 @@ mod tests {
                     physicals: vec![Physical {
                         id: 10,
                         regions: vec![
-                            Region { start: vec![], end: split.clone(), leader_store: 1 },
-                            Region { start: split, end: vec![], leader_store: 2 },
+                            Region {
+                                start: vec![],
+                                end: split.clone(),
+                                leader_store: 1,
+                            },
+                            Region {
+                                start: split,
+                                end: vec![],
+                                leader_store: 2,
+                            },
                         ],
                     }],
                     table_leader: 0,
@@ -599,8 +753,14 @@ mod tests {
                 },
             );
         }
-        assert_eq!(r.locate("test", "t", Some(("id", 5))), (Some("a:1".into()), Reason::Point));
-        assert_eq!(r.locate("test", "t", Some(("id", 5000))), (Some("b:1".into()), Reason::Point));
+        assert_eq!(
+            r.locate("test", "t", Some(("id", 5))),
+            (Some("a:1".into()), Reason::Point)
+        );
+        assert_eq!(
+            r.locate("test", "t", Some(("id", 5000))),
+            (Some("b:1".into()), Reason::Point)
+        );
         assert_eq!(r.locate("test", "t", None), (None, Reason::Default));
         assert_eq!(r.locate("test", "missing", None), (None, Reason::Default));
     }
