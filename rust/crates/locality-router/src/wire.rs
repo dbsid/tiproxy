@@ -51,12 +51,26 @@ pub mod status {
     pub const MORE_RESULTS: u16 = 0x0008;
     /// `SERVER_STATUS_CURSOR_EXISTS`.
     pub const CURSOR_EXISTS: u16 = 0x0040;
+    /// tidb-one session tracking (`tidb_one_session_track = ON`): the session
+    /// holds state that cannot migrate (temporary tables, advisory locks,
+    /// `LOCK TABLES`, a pending `SET TRANSACTION`).
+    pub const TIDB_ONE_UNMIGRATABLE: u16 = 0x0004;
+    /// `SERVER_SESSION_STATE_CHANGED`; with tidb-one session tracking: the
+    /// statement may have changed state carried by `SHOW SESSION_STATES`.
+    pub const SESSION_STATE_CHANGED: u16 = 0x4000;
+    /// tidb-one session tracking: the statement set `LAST_INSERT_ID()`; an OK
+    /// packet carries the value in its last-insert-id field.
+    pub const TIDB_ONE_LAST_INSERT_ID: u16 = 0x8000;
+    /// All tidb-one tracking bits, removed before packets reach the client.
+    pub const TIDB_ONE_MASK: u16 = TIDB_ONE_UNMIGRATABLE | SESSION_STATE_CHANGED | TIDB_ONE_LAST_INSERT_ID;
 }
 
 /// Command bytes used by the router.
 pub mod cmd {
     /// `COM_QUIT`.
     pub const QUIT: u8 = 0x01;
+    /// `COM_PROCESS_KILL`.
+    pub const PROCESS_KILL: u8 = 0x0c;
     /// `COM_INIT_DB`.
     pub const INIT_DB: u8 = 0x02;
     /// `COM_QUERY`.
@@ -288,6 +302,30 @@ pub fn eof_status(p: &[u8], deprecate_eof: bool) -> Option<u16> {
     }
 }
 
+/// Offset of the status flags in an OK packet (header 0x00 or 0xfe).
+fn ok_status_at(p: &[u8]) -> Option<usize> {
+    let mut pos = 1;
+    lenenc_int(p, &mut pos)?;
+    lenenc_int(p, &mut pos)?;
+    (pos + 2 <= p.len()).then_some(pos)
+}
+
+/// The last-insert-id field of an OK packet (header 0x00 or 0xfe).
+pub fn ok_last_insert_id(p: &[u8]) -> Option<u64> {
+    let mut pos = 1;
+    lenenc_int(p, &mut pos)?;
+    lenenc_int(p, &mut pos)
+}
+
+/// Rewrites the status flags of an OK packet, or of an EOF packet when
+/// `ok_form` is false, in place.
+pub fn set_terminator_status(p: &mut [u8], ok_form: bool, status: u16) {
+    let at = if ok_form { ok_status_at(p) } else { (p.len() >= 5).then_some(3) };
+    if let Some(at) = at {
+        p[at..at + 2].copy_from_slice(&status.to_le_bytes());
+    }
+}
+
 /// Builds an OK packet.
 pub fn ok_packet(status: u16) -> Vec<u8> {
     vec![0x00, 0, 0, (status & 0xff) as u8, (status >> 8) as u8, 0, 0]
@@ -311,6 +349,8 @@ pub struct Greeting {
     pub capabilities: u32,
     /// Auth plugin data (salt).
     pub salt: Vec<u8>,
+    /// Connection ID assigned by the server.
+    pub conn_id: u32,
     /// Offsets of the low and high capability words, for rewriting.
     cap_low_at: usize,
     cap_high_at: Option<usize>,
@@ -324,14 +364,16 @@ impl Greeting {
         }
         let mut pos = 1;
         nul_str(p, &mut pos)?; // server version
-        pos += 4; // connection id
+        let id = p.get(pos..pos + 4)?;
+        let conn_id = u32::from_le_bytes([id[0], id[1], id[2], id[3]]);
+        pos += 4;
         let mut salt = p.get(pos..pos + 8)?.to_vec();
         pos += 9; // salt part 1 + filler
         let cap_low_at = pos;
         let low = u32::from(u16::from_le_bytes([*p.get(pos)?, *p.get(pos + 1)?]));
         pos += 2;
         if pos >= p.len() {
-            return Some(Self { capabilities: low, salt, cap_low_at, cap_high_at: None });
+            return Some(Self { capabilities: low, salt, conn_id, cap_low_at, cap_high_at: None });
         }
         pos += 3; // charset + status
         let cap_high_at = pos;
@@ -347,7 +389,7 @@ impl Greeting {
                 salt.extend_from_slice(part2);
             }
         }
-        Some(Self { capabilities, salt, cap_low_at, cap_high_at: Some(cap_high_at) })
+        Some(Self { capabilities, salt, conn_id, cap_low_at, cap_high_at: Some(cap_high_at) })
     }
 
     /// Rewrites the capability flags of the greeting packet `p` in place.

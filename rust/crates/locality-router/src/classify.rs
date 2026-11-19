@@ -25,6 +25,8 @@ pub enum Kind {
     Delete,
     /// `USE db`.
     Use,
+    /// `KILL [TIDB] [CONNECTION | QUERY] id`.
+    Kill,
     /// Anything else.
     Other,
 }
@@ -61,6 +63,37 @@ pub struct Classified {
     pub dirty: bool,
     /// For `USE db`: the database.
     pub use_db: Option<String>,
+    /// The statement reads values that describe the previous statement
+    /// (`ROW_COUNT()`, `FOUND_ROWS()`, warnings), so it must run on the
+    /// connection that ran the previous statement.
+    pub prev_dependent: bool,
+    /// For `BEGIN`: it has no options, so it cannot fail and may be pipelined
+    /// with the statement that follows it.
+    pub simple_begin: bool,
+    /// For `KILL`.
+    pub kill: Option<Kill>,
+}
+
+/// A parsed `KILL` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kill {
+    /// `KILL QUERY` (otherwise the connection is killed).
+    pub query: bool,
+    /// The `TIDB` keyword was present.
+    pub tidb: bool,
+    /// Target connection ID.
+    pub id: u64,
+}
+
+impl Kill {
+    /// Renders the statement for connection `id`.
+    pub fn sql(&self, id: u64) -> String {
+        format!(
+            "KILL {}{} {id}",
+            if self.tidb { "TIDB " } else { "" },
+            if self.query { "QUERY" } else { "CONNECTION" }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +104,7 @@ enum Tok {
     Str,
     Param,
     Punct(u8),
-    Var, // @name or @@name
+    Var(String), // @name or @@name, lower-cased
 }
 
 fn tokenize(sql: &[u8], limit: usize) -> Vec<Tok> {
@@ -137,10 +170,11 @@ fn tokenize(sql: &[u8], limit: usize) -> Vec<Tok> {
             out.push(Tok::Param);
             i += 1;
         } else if c == b'@' {
+            let start = i;
             while i < sql.len() && (sql[i] == b'@' || sql[i].is_ascii_alphanumeric() || sql[i] == b'_' || sql[i] == b'.') {
                 i += 1;
             }
-            out.push(Tok::Var);
+            out.push(Tok::Var(String::from_utf8_lossy(&sql[start..i]).to_lowercase()));
         } else {
             out.push(Tok::Punct(c));
             i += 1;
@@ -285,18 +319,62 @@ fn insert_points(toks: &[Tok], after_table: usize) -> Vec<(String, Value)> {
 /// Classifies one SQL statement.
 pub fn classify(sql: &[u8]) -> Classified {
     let toks = tokenize(sql, 4096);
-    let has_var = toks.contains(&Tok::Var);
+    let has_var = toks.iter().any(|t| matches!(t, Tok::Var(_)));
     let mentions = |names: &[&str]| toks.iter().any(|t| matches!(t, Tok::Word(w) if names.contains(&w.as_str())));
-    let session_fn = mentions(&["last_insert_id", "found_rows", "row_count", "get_lock", "release_lock"]);
-    let mut c = Classified { kind: Kind::Other, table: None, point: None, dirty: true, use_db: None };
+    let session_fn = mentions(&[
+        "last_insert_id",
+        "found_rows",
+        "row_count",
+        "get_lock",
+        "release_lock",
+        "release_all_locks",
+        "nextval",
+        "setval",
+    ]);
+    // A multi-statement query: only the first statement is classified, so
+    // assume the others change session state.
+    let multi = toks.iter().position(|t| *t == Tok::Punct(b';')).is_some_and(|i| i + 1 < toks.len());
+    let prev_dependent = mentions(&["found_rows", "row_count"])
+        || toks.iter().any(|t| matches!(t, Tok::Var(v) if v.ends_with("warning_count") || v.ends_with("error_count")))
+        || (word(toks.first()) == Some("show") && matches!(word(toks.get(1)), Some("warnings" | "errors" | "count")));
+    let mut c = Classified {
+        kind: Kind::Other,
+        table: None,
+        point: None,
+        dirty: true,
+        use_db: None,
+        prev_dependent,
+        simple_begin: false,
+        kill: None,
+    };
     let Some(first) = word(toks.first()) else {
         return c;
     };
     match first {
         "begin" if toks.len() == 1 || matches!(word(toks.get(1)), Some("pessimistic" | "optimistic" | "work")) => {
             c.kind = Kind::Begin;
+            c.simple_begin = toks.len() <= 2;
         }
-        "start" if word(toks.get(1)) == Some("transaction") => c.kind = Kind::Begin,
+        "start" if word(toks.get(1)) == Some("transaction") => {
+            c.kind = Kind::Begin;
+            c.simple_begin = toks.len() == 2;
+        }
+        "kill" => {
+            let mut i = 1;
+            let tidb = word(toks.get(i)) == Some("tidb");
+            if tidb {
+                i += 1;
+            }
+            let query = word(toks.get(i)) == Some("query");
+            if query || word(toks.get(i)) == Some("connection") {
+                i += 1;
+            }
+            if let (Some(Tok::Int(id)), true) = (toks.get(i), toks.len() == i + 1) {
+                c.kind = Kind::Kill;
+                c.kill = u64::try_from(*id).ok().map(|id| Kill { query, tidb, id });
+            }
+            return c;
+        }
         "commit" => c.kind = Kind::Commit,
         "rollback" if !mentions(&["savepoint"]) && word(toks.get(1)) != Some("to") => c.kind = Kind::Rollback,
         "use" => {
@@ -360,7 +438,7 @@ pub fn classify(sql: &[u8]) -> Classified {
         }
         _ => return c,
     }
-    c.dirty = has_var || session_fn;
+    c.dirty = has_var || session_fn || multi;
     c
 }
 
@@ -433,5 +511,92 @@ mod tests {
         assert_eq!(u.kind, Kind::Use);
         assert_eq!(u.use_db.as_deref(), Some("test_ta"));
         assert!(!classify(b"/* hint */ select 1 from t where id = 1").dirty);
+        assert!(classify(b"SELECT v FROM t WHERE id = 1; SET SESSION sql_mode = ''").dirty);
+        assert!(!classify(b"SELECT v FROM t WHERE id = 1;").dirty);
+        assert!(classify(b"SELECT NEXTVAL(s) FROM t WHERE id = 1").dirty);
+    }
+
+    #[test]
+    fn begin_forms() {
+        assert!(classify(b"BEGIN").simple_begin);
+        assert!(classify(b"begin pessimistic").simple_begin);
+        assert!(classify(b"START TRANSACTION").simple_begin);
+        assert!(!classify(b"START TRANSACTION READ ONLY").simple_begin);
+        assert!(!classify(b"START TRANSACTION WITH CONSISTENT SNAPSHOT").simple_begin);
+        assert!(
+            !classify(b"START TRANSACTION READ ONLY AS OF TIMESTAMP NOW() - INTERVAL 5 SECOND")
+                .simple_begin
+        );
+        assert!(!classify(b"SELECT 1").simple_begin);
+    }
+
+    #[test]
+    fn previous_statement_readers() {
+        assert!(classify(b"SELECT ROW_COUNT()").prev_dependent);
+        assert!(classify(b"INSERT INTO t2 (id, n) VALUES (1, FOUND_ROWS())").prev_dependent);
+        assert!(classify(b"SELECT @@warning_count").prev_dependent);
+        assert!(classify(b"SELECT @@session.error_count").prev_dependent);
+        assert!(classify(b"SHOW WARNINGS").prev_dependent);
+        assert!(classify(b"show count(*) errors").prev_dependent);
+        assert!(!classify(b"SELECT LAST_INSERT_ID()").prev_dependent);
+        assert!(!classify(b"INSERT INTO t2 (id, p) VALUES (5, LAST_INSERT_ID())").prev_dependent);
+    }
+
+    #[test]
+    fn kill_statements() {
+        let k = |sql: &[u8]| classify(sql).kill;
+        assert_eq!(
+            k(b"KILL 42"),
+            Some(Kill {
+                query: false,
+                tidb: false,
+                id: 42
+            })
+        );
+        assert_eq!(
+            k(b"kill query 42"),
+            Some(Kill {
+                query: true,
+                tidb: false,
+                id: 42
+            })
+        );
+        assert_eq!(
+            k(b"KILL CONNECTION 7"),
+            Some(Kill {
+                query: false,
+                tidb: false,
+                id: 7
+            })
+        );
+        assert_eq!(
+            k(b"KILL TIDB QUERY 9"),
+            Some(Kill {
+                query: true,
+                tidb: true,
+                id: 9
+            })
+        );
+        assert_eq!(k(b"KILL QUERY @id"), None);
+        assert_eq!(k(b"KILL 1 2"), None);
+        assert_eq!(classify(b"KILL QUERY 3").kind, Kind::Kill);
+        assert_eq!(
+            Kill {
+                query: true,
+                tidb: true,
+                id: 1
+            }
+            .sql(5),
+            "KILL TIDB QUERY 5"
+        );
+        assert_eq!(
+            Kill {
+                query: false,
+                tidb: false,
+                id: 1
+            }
+            .sql(5),
+            "KILL CONNECTION 5"
+        );
     }
 }

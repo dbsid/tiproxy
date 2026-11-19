@@ -21,6 +21,7 @@
 
 pub mod classify;
 pub mod keycodec;
+pub mod kill;
 pub mod router;
 pub mod session;
 pub mod wire;
@@ -32,7 +33,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-pub use router::Router;
+pub use router::{Router, SessionOptions};
 
 /// Command-line options of the locality router.
 #[derive(Debug, Clone)]
@@ -47,6 +48,8 @@ pub struct Options {
     pub pd: Vec<String>,
     /// Routing table refresh interval.
     pub refresh: Duration,
+    /// Session behavior.
+    pub session: SessionOptions,
 }
 
 /// Parses `--flag value` pairs.
@@ -57,6 +60,7 @@ pub fn parse_options<I: Iterator<Item = String>>(mut args: I) -> Result<Options,
         tidb_status: Vec::new(),
         pd: Vec::new(),
         refresh: Duration::from_secs(1),
+        session: SessionOptions::default(),
     };
     let list = |v: String| v.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect::<Vec<_>>();
     while let Some(flag) = args.next() {
@@ -70,6 +74,9 @@ pub fn parse_options<I: Iterator<Item = String>>(mut args: I) -> Result<Options,
                 let ms: u64 = value()?.parse().map_err(|e| format!("--refresh-ms: {e}"))?;
                 o.refresh = Duration::from_millis(ms.max(100));
             }
+            "--no-session-track" => o.session.session_track = false,
+            "--no-pipeline-begin" => o.session.pipeline_begin = false,
+            "--verify-session-states" => o.session.verify_session_states = true,
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -81,7 +88,7 @@ pub fn parse_options<I: Iterator<Item = String>>(mut args: I) -> Result<Options,
 
 /// Runs the router until the process exits.
 pub async fn run(o: Options) -> io::Result<()> {
-    let router = Router::new(o.tidb_status.clone(), o.pd.clone());
+    let router = Router::with_options(o.tidb_status.clone(), o.pd.clone(), o.session.clone());
     tokio::spawn(Arc::clone(&router).refresh_loop(o.refresh));
     if let Some(addr) = &o.status {
         let listener = TcpListener::bind(addr).await?;
