@@ -39,15 +39,21 @@
 //!
 //! `KILL` with any connection ID of a routed session is rewritten to the
 //! connection that runs the session now (see `kill.rs`).
+//!
+//! When a backend drains (see `router.rs`), the session closes its idle
+//! connections to it and moves off it at the next transaction boundary, also
+//! while the client is idle. A session that cannot move (open transaction,
+//! unmigratable state) stays until it can, or until the backend goes away.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value as Json;
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::classify::{self, Classified, Kill, Kind, Value};
@@ -92,10 +98,19 @@ struct BackendConn {
     stmt_ids: HashMap<u32, u32>,
     /// Client statement IDs whose parameter types this connection has received.
     typed: HashSet<u32>,
+    /// Open connections to `addr` across sessions (`Router::conn_counter`).
+    count: Arc<AtomicI64>,
+}
+
+impl Drop for BackendConn {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl BackendConn {
-    fn new(addr: &str, conn: PacketConn, conn_id: u32, status: u16) -> Self {
+    fn new(addr: &str, conn: PacketConn, conn_id: u32, status: u16, count: Arc<AtomicI64>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
         Self {
             addr: addr.to_owned(),
             conn,
@@ -107,6 +122,7 @@ impl BackendConn {
             option_synced: 0,
             stmt_ids: HashMap::new(),
             typed: HashSet::new(),
+            count,
         }
     }
 
@@ -192,6 +208,8 @@ pub struct Session {
     handle: Arc<SessionHandle>,
     /// Connection ID the client saw in the handshake.
     client_conn_id: u32,
+    /// Changes when backends start or stop draining.
+    drain_rx: watch::Receiver<u64>,
 }
 
 fn other(msg: impl Into<String>) -> io::Error {
@@ -277,13 +295,21 @@ impl Session {
             .backend_conns
             .fetch_add(1, Ordering::Relaxed);
         let handle = SessionHandle::new(&backend_addr, g.conn_id);
+        let drain_rx = router.subscribe_drain();
+        let count = router.conn_counter(&backend_addr);
         let mut s = Self {
             router,
             client,
             hs,
             caps,
             db,
-            backends: vec![BackendConn::new(&backend_addr, backend, g.conn_id, st)],
+            backends: vec![BackendConn::new(
+                &backend_addr,
+                backend,
+                g.conn_id,
+                st,
+                count,
+            )],
             cur: 0,
             durable_version: 0,
             lii: Some(0),
@@ -300,6 +326,7 @@ impl Session {
             cache: HashMap::new(),
             handle,
             client_conn_id: g.conn_id,
+            drain_rx,
         };
         s.enable_tracking(0).await?;
         Ok(Some(s))
@@ -364,14 +391,33 @@ impl Session {
     pub async fn run(mut self) -> io::Result<()> {
         let handle = Arc::clone(&self.handle);
         let result = loop {
-            self.client.reset_seq();
-            let pkt = tokio::select! {
-                r = self.client.read() => match r {
-                    Ok(p) => p,
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
-                    Err(e) => break Err(e),
-                },
+            if self.router.any_draining()
+                && let Err(e) = self.leave_draining().await
+            {
+                break Err(e);
+            }
+            // Wait for the next command without consuming it, so a drain
+            // can interrupt the wait of an idle session.
+            let ready = tokio::select! {
+                r = self.client.wait_data() => r,
                 () = handle.killed.notified() => break Ok(()),
+                r = self.drain_rx.changed() => {
+                    if r.is_err() {
+                        break Ok(());
+                    }
+                    continue;
+                }
+            };
+            match ready {
+                Ok(true) => {}
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+            self.client.reset_seq();
+            let pkt = match self.client.read().await {
+                Ok(p) => p,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                Err(e) => break Err(e),
             };
             let Some(&command) = pkt.first() else {
                 continue;
@@ -506,8 +552,63 @@ impl Session {
         (addr, reason)
     }
 
+    /// Closes idle connections to draining backends and, at a transaction
+    /// boundary, moves the session off a draining current backend.
+    async fn leave_draining(&mut self) -> io::Result<()> {
+        let mut i = 0;
+        while i < self.backends.len() {
+            if i != self.cur && self.router.is_draining(&self.backends[i].addr) {
+                self.drop_backend(i).await;
+            } else {
+                i += 1;
+            }
+        }
+        let cur_addr = self.backends[self.cur].addr.clone();
+        if !self.router.is_draining(&cur_addr)
+            || !self.at_boundary()
+            || self.blocked
+            || !self.prelude.is_empty()
+        {
+            return Ok(());
+        }
+        let Some(target) = self.router.pick_open() else {
+            return Ok(());
+        };
+        self.switch_to(Some(target), false).await;
+        if self.backends[self.cur].addr != cur_addr
+            && let Some(old) = self.backends.iter().position(|b| b.addr == cur_addr)
+        {
+            self.drop_backend(old).await;
+            self.router
+                .counters
+                .drain_moved
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Closes backend connection `i`, which is not the current one.
+    async fn drop_backend(&mut self, i: usize) {
+        debug_assert_ne!(i, self.cur);
+        let mut b = self.backends.remove(i);
+        if self.cur > i {
+            self.cur -= 1;
+        }
+        self.verify_from = match self.verify_from {
+            Some(v) if v == i => None,
+            Some(v) if v > i => Some(v - 1),
+            v => v,
+        };
+        b.conn.reset_seq();
+        let _ = b.conn.send(&[cmd::QUIT]).await;
+        self.router
+            .counters
+            .backend_conns
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Moves the session to `addr` if it is not already there and may move.
-    async fn switch_to(&mut self, addr: Option<String>, c: &Classified) {
+    async fn switch_to(&mut self, addr: Option<String>, prev_dependent: bool) {
         let Some(addr) = addr else { return };
         if self.backends[self.cur].addr == addr {
             return;
@@ -517,7 +618,7 @@ impl Session {
             counters.switch_pinned.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if c.prev_dependent {
+        if prev_dependent {
             counters
                 .switch_prev_dependent
                 .fetch_add(1, Ordering::Relaxed);
@@ -722,7 +823,7 @@ impl Session {
         }
         let st = wire::ok_status(&p).unwrap_or(status::AUTOCOMMIT) & !status::TIDB_ONE_MASK;
         self.handle.register(g.conn_id);
-        let fresh = BackendConn::new(addr, conn, g.conn_id, st);
+        let fresh = BackendConn::new(addr, conn, g.conn_id, st, self.router.conn_counter(addr));
         let counters = &self.router.counters;
         if let Some(i) = replace {
             let mut old = std::mem::replace(&mut self.backends[i], fresh);
@@ -811,7 +912,7 @@ impl Session {
                     .txn_routed
                     .fetch_add(1, Ordering::Relaxed);
             }
-            self.switch_to(addr, c).await;
+            self.switch_to(addr, c.prev_dependent).await;
         }
         if let Some(db) = &c.use_db {
             self.db = Some(db.clone());
@@ -1401,7 +1502,7 @@ impl Session {
                     .txn_routed
                     .fetch_add(1, Ordering::Relaxed);
             }
-            self.switch_to(addr, c).await;
+            self.switch_to(addr, c.prev_dependent).await;
         }
         if !self.ensure_prepared(id).await? {
             return Ok(());

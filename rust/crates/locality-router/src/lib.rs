@@ -151,19 +151,92 @@ async fn serve_status(listener: TcpListener, router: Arc<Router>) {
         };
         let router = Arc::clone(&router);
         tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; 4096];
             let n = s.read(&mut buf).await.unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
-            let body = if req.starts_with("GET /metrics") {
-                router.render_metrics()
-            } else {
-                "ok\n".to_owned()
-            };
+            let (code, ctype, body) = status_response(&router, &req);
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {code}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = s.write_all(resp.as_bytes()).await;
         });
+    }
+}
+
+const TEXT: &str = "text/plain; version=0.0.4";
+const JSON: &str = "application/json";
+
+/// Answers one request on the status port.
+///
+/// * `GET /metrics`: Prometheus metrics.
+/// * `GET /api/backends`: backends with drain state and open connections.
+/// * `POST /api/backends/drain?addr=HOST:PORT`: stop sending new sessions and
+///   transactions to the `TiDB` SQL address and move sessions off it.
+/// * `POST /api/backends/resume?addr=HOST:PORT`: undo a drain.
+///
+/// The port has no authentication, like the `TiDB` status port; bind it to a
+/// management network.
+fn status_response(router: &Router, req: &str) -> (&'static str, &'static str, String) {
+    let line = req.lines().next().unwrap_or("");
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let addr = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("addr="))
+        .map(|a| a.replace("%3A", ":").replace("%3a", ":"))
+        .filter(|a| !a.is_empty());
+    match (method, path) {
+        ("GET", "/metrics") => ("200 OK", TEXT, router.render_metrics()),
+        ("GET", "/api/backends") => ("200 OK", JSON, router.backends_json().to_string()),
+        ("POST" | "PUT", "/api/backends/drain" | "/api/backends/resume") => {
+            let Some(addr) = addr else {
+                return (
+                    "400 Bad Request",
+                    TEXT,
+                    "missing addr=HOST:PORT\n".to_owned(),
+                );
+            };
+            if path.ends_with("drain") {
+                router.drain(&addr);
+            } else {
+                router.resume(&addr);
+            }
+            ("200 OK", JSON, router.backends_json().to_string())
+        }
+        (_, "/api/backends/drain" | "/api/backends/resume") => {
+            ("405 Method Not Allowed", TEXT, "use POST\n".to_owned())
+        }
+        _ => ("200 OK", TEXT, "ok\n".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_api() {
+        let r = Router::new(vec![], vec![]);
+        let (code, _, body) = status_response(
+            &r,
+            "POST /api/backends/drain?addr=10.0.0.1%3A4000 HTTP/1.1\r\n\r\n",
+        );
+        assert_eq!(code, "200 OK");
+        assert!(body.contains("\"addr\":\"10.0.0.1:4000\""), "{body}");
+        assert!(r.is_draining("10.0.0.1:4000"));
+        let (code, _, _) = status_response(&r, "GET /api/backends/drain?addr=x:1 HTTP/1.1\r\n");
+        assert_eq!(code, "405 Method Not Allowed");
+        let (code, _, _) = status_response(&r, "POST /api/backends/drain HTTP/1.1\r\n");
+        assert_eq!(code, "400 Bad Request");
+        status_response(
+            &r,
+            "POST /api/backends/resume?addr=10.0.0.1:4000 HTTP/1.1\r\n",
+        );
+        assert!(!r.any_draining());
+        let (_, ctype, _) = status_response(&r, "GET /metrics HTTP/1.1\r\n");
+        assert_eq!(ctype, TEXT);
     }
 }
