@@ -190,6 +190,8 @@ pub struct Session {
     observed: Observed,
     cache: HashMap<Vec<u8>, Arc<Entry>>,
     handle: Arc<SessionHandle>,
+    /// Connection ID the client saw in the handshake.
+    client_conn_id: u32,
 }
 
 fn other(msg: impl Into<String>) -> io::Error {
@@ -297,22 +299,39 @@ impl Session {
             observed: Observed::default(),
             cache: HashMap::new(),
             handle,
+            client_conn_id: g.conn_id,
         };
         s.enable_tracking(0).await?;
         Ok(Some(s))
     }
 
-    /// Turns on tidb-one session tracking for backend `i`. A server without it
-    /// (upstream `TiDB`) answers with an error and the session falls back to the
-    /// SQL classifier.
+    /// Turns on tidb-one session tracking for backend `i` and puts the
+    /// connection in the session group of the client's connection ID, so that
+    /// `CONNECTION_ID()` and `KILL` from any router see one session. A server
+    /// without tracking (upstream `TiDB`) answers with an error and the session
+    /// falls back to the SQL classifier; one without session groups (an older
+    /// tidb-one) gets tracking alone. Connections opened later inherit both
+    /// through the session states.
     async fn enable_tracking(&mut self, i: usize) -> io::Result<()> {
         if !self.router.options.session_track {
             return Ok(());
         }
+        let with_group = query_packet(
+            format!(
+                "SET SESSION tidb_one_session_track = ON, tidb_one_session_group = {}",
+                self.client_conn_id
+            )
+            .as_bytes(),
+        );
         let b = &mut self.backends[i];
         b.conn.reset_seq();
-        b.conn.send(ENABLE_TRACKING).await?;
+        b.conn.send(&with_group).await?;
         let mut p = b.conn.read().await?;
+        if wire::kind(&p) != PacketKind::Ok {
+            b.conn.reset_seq();
+            b.conn.send(ENABLE_TRACKING).await?;
+            p = b.conn.read().await?;
+        }
         b.tracking = wire::kind(&p) == PacketKind::Ok;
         if b.tracking {
             let s = wire::ok_status(&p).unwrap_or(b.status) & !status::TIDB_ONE_MASK;

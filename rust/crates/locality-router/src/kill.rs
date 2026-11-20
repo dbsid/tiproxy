@@ -5,12 +5,16 @@
 //!
 //! A routed session runs its statements on one of several backend
 //! connections, and each has its own `TiDB` connection ID. The client only knows
-//! the ID of the connection it authenticated on (from the greeting), and
-//! `CONNECTION_ID()` returns the ID of whichever connection runs the query.
+//! the ID of the connection it authenticated on (from the greeting).
 //! The registry maps every backend connection ID of every live session in
 //! this router to the session, so `KILL [QUERY] id` with any of them can be
 //! rewritten to the connection that runs the session right now. `TiDB`'s global
 //! kill then delivers it to the right server.
+//!
+//! tidb-one also knows the session: every backend connection is in the
+//! session group of the client's connection ID (`tidb_one_session_group`), so
+//! `CONNECTION_ID()` returns that ID everywhere and tidb-one kills the whole
+//! group for a `KILL` that reaches it through another router or directly.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
