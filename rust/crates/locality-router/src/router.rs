@@ -417,8 +417,8 @@ impl Router {
     }
 
     /// Backends with their drain state and open connections, for
-    /// `GET /api/backends`. Draining addresses that left `/info/all` but
-    /// still have connections are included.
+    /// `GET /api/backends`. Draining addresses that left `/info/all` are
+    /// included until their last connection closes.
     pub fn backends_json(&self) -> Json {
         let backends = self.backends();
         let drains = self.drains.lock().map(|d| d.clone()).unwrap_or_default();
@@ -645,10 +645,41 @@ impl Router {
         if backends.is_empty() {
             return Err(io::Error::other("/info/all returned no servers"));
         }
+        self.set_backends(backends);
+        Ok(())
+    }
+
+    /// Replaces the backend list with the servers in `/info/all`.
+    fn set_backends(&self, backends: Vec<Backend>) {
+        // Forget drains of servers that left `/info/all` (scaled in, or
+        // stopped) once no session uses them, so the list does not grow.
+        // Sessions still leave such servers: they are not in the list.
+        let gone: Vec<String> = self
+            .drains
+            .lock()
+            .map(|d| {
+                d.keys()
+                    .filter(|a| !backends.iter().any(|b| &b.sql_addr == *a))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let idle: Vec<String> = gone
+            .into_iter()
+            .filter(|a| self.conn_count(a) == 0)
+            .collect();
+        if !idle.is_empty()
+            && let Ok(mut d) = self.drains.lock()
+        {
+            for a in &idle {
+                d.remove(a);
+            }
+            let n = d.values().filter(|d| d.active()).count();
+            self.draining.store(n, Ordering::Release);
+        }
         if let Ok(mut s) = self.state.write() {
             s.backends = backends;
         }
-        Ok(())
     }
 
     async fn refresh_table(&self, db: &str, table: &str) -> io::Result<()> {
@@ -1083,6 +1114,32 @@ mod tests {
             d.unhealthy = false;
         });
         assert!(!r.is_draining("a:1"));
+    }
+
+    #[test]
+    fn drain_of_removed_backend_is_forgotten() {
+        let r = two_backends();
+        r.drain("a:1");
+        let conns = r.conn_counter("a:1");
+        conns.fetch_add(1, Ordering::Relaxed);
+        let only_b = || {
+            vec![Backend {
+                sql_addr: "b:1".into(),
+                status_addr: String::new(),
+                store_id: 0,
+            }]
+        };
+        // Scaled in, but a session still uses it: it stays listed.
+        r.set_backends(only_b());
+        assert!(r.any_draining());
+        assert_eq!(r.backends_json().as_array().map(Vec::len), Some(2));
+        // Its last session is gone: the drain is dropped.
+        conns.fetch_sub(1, Ordering::Relaxed);
+        r.set_backends(only_b());
+        assert!(!r.any_draining());
+        assert_eq!(r.backends_json().as_array().map(Vec::len), Some(1));
+        // Sessions still never go to a server outside `/info/all`.
+        assert!(r.is_draining("a:1"));
     }
 
     #[tokio::test]
