@@ -395,7 +395,9 @@ impl Router {
     }
 
     /// Ends an operator's drain of `sql_addr`. A backend whose probe fails
-    /// keeps draining until it is healthy again.
+    /// keeps draining until it is healthy again. A drain also ends when the
+    /// backend becomes unhealthy and then healthy again (it restarted), so a
+    /// node restarted without a `resume` call does not stay drained.
     pub fn resume(&self, sql_addr: &str) {
         self.update_drain(sql_addr, |d| d.api = false);
     }
@@ -470,6 +472,11 @@ impl Router {
         while let Some(Ok((addr, ok))) = probes.join_next().await {
             self.update_drain(&addr, |d| {
                 if ok {
+                    if d.unhealthy {
+                        // The backend went away and came back: it restarted,
+                        // which ends a drain requested for the restart.
+                        d.api = false;
+                    }
                     d.failures = 0;
                     d.unhealthy = false;
                 } else {
@@ -1076,6 +1083,44 @@ mod tests {
             d.unhealthy = false;
         });
         assert!(!r.is_draining("a:1"));
+    }
+
+    #[tokio::test]
+    async fn restart_ends_requested_drain() -> io::Result<()> {
+        // A status endpoint that can be switched between down and up.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let status = listener.local_addr()?.to_string();
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up2 = Arc::clone(&up);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf).await;
+                let resp: &[u8] = if up2.load(Ordering::Relaxed) {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                } else {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = s.write_all(resp).await;
+            }
+        });
+        let r = two_backends();
+        if let Ok(mut s) = r.state.write() {
+            s.backends.truncate(1);
+            s.backends[0].status_addr = status;
+        }
+        r.drain("a:1");
+        r.probe_backends().await;
+        r.probe_backends().await;
+        assert!(r.is_draining("a:1"));
+        // The server restarted: healthy again, and the drain is over.
+        up.store(true, Ordering::Relaxed);
+        r.probe_backends().await;
+        assert!(
+            !r.is_draining("a:1"),
+            "the requested drain ended with the restart"
+        );
+        Ok(())
     }
 
     #[test]
