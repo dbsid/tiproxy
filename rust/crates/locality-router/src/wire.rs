@@ -6,7 +6,9 @@
 
 use std::io;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
+};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -148,6 +150,17 @@ impl PacketConn {
                 return Err(invalid("logical packet too large"));
             }
         }
+    }
+
+    /// Waits until data can be read, without consuming it, and returns false
+    /// at end of stream. Unlike [`PacketConn::read`] it can be cancelled (for
+    /// example in `tokio::select!`) without losing data.
+    ///
+    /// # Errors
+    ///
+    /// Read errors.
+    pub async fn wait_data(&mut self) -> io::Result<bool> {
+        Ok(!self.reader.fill_buf().await?.is_empty())
     }
 
     /// Queues one logical packet; call [`PacketConn::flush`] to send.

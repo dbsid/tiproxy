@@ -14,17 +14,25 @@
 //!
 //! Lookups only read cached state; a miss schedules a fetch and the statement
 //! falls back to the current backend.
+//!
+//! Backends can be drained: no new session or transaction goes to a draining
+//! backend, and sessions leave it at their next transaction boundary (see
+//! `Session::leave_draining`). A backend drains when an operator asks for it
+//! (`POST /api/backends/drain` on the status port, used by `TiUP` before it
+//! restarts a node), when its `/status` fails twice in a row (`TiDB` answers
+//! 500 once it starts shutting down), or when it leaves `/info/all`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use serde_json::Value as Json;
+use serde_json::{Value as Json, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::keycodec;
@@ -34,6 +42,29 @@ pub const STORE_ID_LABEL: &str = "tidb_one_store_id";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const TABLE_META_TTL: Duration = Duration::from_secs(30);
+/// Timeout of one `/status` probe.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Consecutive failed probes after which a backend drains.
+const PROBE_FAILURES: u32 = 2;
+
+/// Why a backend is draining.
+#[derive(Debug, Clone, Default)]
+struct Drain {
+    /// An operator asked for it (`POST /api/backends/drain`).
+    api: bool,
+    /// Its `/status` failed `PROBE_FAILURES` times in a row.
+    unhealthy: bool,
+    /// Consecutive failed probes.
+    failures: u32,
+    /// When the backend started draining.
+    since: Option<Instant>,
+}
+
+impl Drain {
+    fn active(&self) -> bool {
+        self.api || self.unhealthy
+    }
+}
 
 /// One SQL backend.
 #[derive(Debug, Clone)]
@@ -137,6 +168,8 @@ pub struct Counters {
     pub txn_routed: AtomicU64,
     /// Client connections accepted.
     pub connections: AtomicU64,
+    /// Sessions moved off a draining backend.
+    pub drain_moved: AtomicU64,
 }
 
 /// Switch kinds, index into `Counters::switch_seconds`.
@@ -228,6 +261,14 @@ pub struct Router {
     state: RwLock<State>,
     wanted: RwLock<HashSet<(String, String)>>,
     rr: AtomicUsize,
+    /// Drain state by SQL address.
+    drains: Mutex<HashMap<String, Drain>>,
+    /// Number of draining SQL addresses, for a lock-free check per command.
+    draining: AtomicUsize,
+    /// Bumped whenever the set of draining backends changes; sessions watch it.
+    drain_epoch: watch::Sender<u64>,
+    /// Open backend connections by SQL address.
+    conns: Mutex<HashMap<String, Arc<AtomicI64>>>,
     /// Counters exported on the status port.
     pub counters: Counters,
     /// Session behavior.
@@ -251,6 +292,10 @@ impl Router {
             state: RwLock::new(State::default()),
             wanted: RwLock::new(HashSet::new()),
             rr: AtomicUsize::new(0),
+            drains: Mutex::new(HashMap::new()),
+            draining: AtomicUsize::new(0),
+            drain_epoch: watch::channel(0).0,
+            conns: Mutex::new(HashMap::new()),
             counters: Counters::default(),
             options,
         })
@@ -264,14 +309,177 @@ impl Router {
             .unwrap_or_default()
     }
 
-    /// Picks the backend of a new connection (round robin).
+    /// Picks the backend of a new connection (round robin over the backends
+    /// that are not draining; any backend if all are).
     pub fn pick_default(&self) -> Option<String> {
-        let backends = self.backends();
+        let mut backends = self.backends();
         if backends.is_empty() {
             return None;
         }
+        if self.any_draining() {
+            let open: Vec<Backend> = backends
+                .iter()
+                .filter(|b| !self.is_draining(&b.sql_addr))
+                .cloned()
+                .collect();
+            if !open.is_empty() {
+                backends = open;
+            }
+        }
         let i = self.rr.fetch_add(1, Ordering::Relaxed) % backends.len();
         Some(backends[i].sql_addr.clone())
+    }
+
+    /// Like `pick_default`, but never a draining backend.
+    pub fn pick_open(&self) -> Option<String> {
+        self.pick_default().filter(|a| !self.is_draining(a))
+    }
+
+    /// Whether any backend is draining (one atomic load).
+    pub fn any_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire) > 0
+    }
+
+    /// Whether sessions must leave the backend at `sql_addr`: it is draining,
+    /// or it is no longer in `/info/all`.
+    pub fn is_draining(&self, sql_addr: &str) -> bool {
+        if self.any_draining()
+            && self
+                .drains
+                .lock()
+                .is_ok_and(|d| d.get(sql_addr).is_some_and(Drain::active))
+        {
+            return true;
+        }
+        self.state.read().is_ok_and(|s| {
+            !s.backends.is_empty() && !s.backends.iter().any(|b| b.sql_addr == sql_addr)
+        })
+    }
+
+    /// Receives a new value whenever the set of draining backends changes.
+    pub fn subscribe_drain(&self) -> watch::Receiver<u64> {
+        self.drain_epoch.subscribe()
+    }
+
+    fn update_drain(&self, sql_addr: &str, f: impl FnOnce(&mut Drain)) {
+        let Ok(mut drains) = self.drains.lock() else {
+            return;
+        };
+        let d = drains.entry(sql_addr.to_owned()).or_default();
+        let was = d.active();
+        f(d);
+        let now = d.active();
+        if now && !was {
+            d.since = Some(Instant::now());
+        } else if !now {
+            d.since = None;
+        }
+        if !now && d.failures == 0 {
+            drains.remove(sql_addr);
+        }
+        let n = drains.values().filter(|d| d.active()).count();
+        drop(drains);
+        self.draining.store(n, Ordering::Release);
+        if now != was {
+            eprintln!(
+                "locality-router: backend {sql_addr} {}",
+                if now { "draining" } else { "open" }
+            );
+            self.drain_epoch.send_modify(|e| *e += 1);
+        }
+    }
+
+    /// Starts draining `sql_addr` on an operator's request.
+    pub fn drain(&self, sql_addr: &str) {
+        self.update_drain(sql_addr, |d| d.api = true);
+    }
+
+    /// Ends an operator's drain of `sql_addr`. A backend whose probe fails
+    /// keeps draining until it is healthy again.
+    pub fn resume(&self, sql_addr: &str) {
+        self.update_drain(sql_addr, |d| d.api = false);
+    }
+
+    /// Counter of open connections to `sql_addr`, shared by the sessions.
+    pub fn conn_counter(&self, sql_addr: &str) -> Arc<AtomicI64> {
+        self.conns.lock().map_or_else(
+            |_| Arc::new(AtomicI64::new(0)),
+            |mut c| Arc::clone(c.entry(sql_addr.to_owned()).or_default()),
+        )
+    }
+
+    fn conn_count(&self, sql_addr: &str) -> i64 {
+        self.conns.lock().map_or(0, |c| {
+            c.get(sql_addr).map_or(0, |n| n.load(Ordering::Relaxed))
+        })
+    }
+
+    /// Backends with their drain state and open connections, for
+    /// `GET /api/backends`. Draining addresses that left `/info/all` but
+    /// still have connections are included.
+    pub fn backends_json(&self) -> Json {
+        let backends = self.backends();
+        let drains = self.drains.lock().map(|d| d.clone()).unwrap_or_default();
+        let mut addrs: Vec<String> = backends.iter().map(|b| b.sql_addr.clone()).collect();
+        for a in drains.keys() {
+            if !addrs.contains(a) {
+                addrs.push(a.clone());
+            }
+        }
+        if let Ok(c) = self.conns.lock() {
+            for (a, n) in c.iter() {
+                if n.load(Ordering::Relaxed) > 0 && !addrs.contains(a) {
+                    addrs.push(a.clone());
+                }
+            }
+        }
+        addrs.sort();
+        let list: Vec<Json> = addrs
+            .iter()
+            .map(|a| {
+                let b = backends.iter().find(|b| &b.sql_addr == a);
+                let d = drains.get(a).cloned().unwrap_or_default();
+                json!({
+                    "addr": a,
+                    "status_addr": b.map(|b| b.status_addr.clone()),
+                    "store_id": b.map_or(0, |b| b.store_id),
+                    "registered": b.is_some(),
+                    "draining": self.is_draining(a),
+                    "drain_requested": d.api,
+                    "healthy": !d.unhealthy,
+                    "draining_seconds": d.since.map(|t| t.elapsed().as_secs_f64()),
+                    "connections": self.conn_count(a),
+                })
+            })
+            .collect();
+        Json::Array(list)
+    }
+
+    /// Probes `/status` of every backend once and updates their health.
+    async fn probe_backends(&self) {
+        let mut probes = tokio::task::JoinSet::new();
+        for b in self.backends() {
+            probes.spawn(async move {
+                let ok = matches!(
+                    timeout(PROBE_TIMEOUT, http_get(&b.status_addr, "/status")).await,
+                    Ok(Ok(_))
+                );
+                (b.sql_addr, ok)
+            });
+        }
+        while let Some(Ok((addr, ok))) = probes.join_next().await {
+            self.update_drain(&addr, |d| {
+                if ok {
+                    d.failures = 0;
+                    d.unhealthy = false;
+                } else {
+                    d.failures += 1;
+                    if d.failures >= PROBE_FAILURES {
+                        d.unhealthy = true;
+                    }
+                }
+            });
+        }
     }
 
     /// Finds the backend next to the leader of the row `handle` of `db.table`,
@@ -336,6 +544,10 @@ impl Router {
                     .map(|b| b.sql_addr.clone())
             })
             .flatten();
+        drop(state);
+        // A draining backend gets no new transactions; the leader is about to
+        // move anyway (TiUP evicts leaders before it drains).
+        let addr = addr.filter(|a| !self.is_draining(a));
         let counter = match (addr.is_some(), reason) {
             (true, Reason::Point) => &self.counters.route_point,
             (true, Reason::Table) => &self.counters.route_table,
@@ -354,6 +566,7 @@ impl Router {
             if let Err(e) = self.refresh_backends().await {
                 eprintln!("locality-router: refresh backends: {e}");
             }
+            self.probe_backends().await;
             let mut keys: Vec<(String, String)> = self
                 .state
                 .read()
@@ -526,6 +739,7 @@ impl Router {
         put("verify_total", "{result=\"mismatch\"}", &c.verify_mismatch);
         put("txn_routed_total", "", &c.txn_routed);
         put("connections_total", "", &c.connections);
+        put("drain_moved_total", "", &c.drain_moved);
         let _ = writeln!(
             s,
             "tiproxy_locality_backend_conns {}",
@@ -546,6 +760,26 @@ impl Router {
                     b.sql_addr, b.store_id
                 );
             }
+        }
+        if let Ok(c) = self.conns.lock() {
+            for (a, n) in c.iter() {
+                let _ = writeln!(
+                    s,
+                    "tiproxy_locality_backend_connections{{addr=\"{a}\"}} {}",
+                    n.load(Ordering::Relaxed)
+                );
+            }
+        }
+        if let Ok(d) = self.drains.lock() {
+            for (a, d) in d.iter().filter(|(_, d)| d.active()) {
+                let _ = writeln!(
+                    s,
+                    "tiproxy_locality_backend_draining{{addr=\"{a}\",requested=\"{}\"}} 1",
+                    d.api
+                );
+            }
+        }
+        if let Ok(st) = self.state.read() {
             for ((db, t), r) in &st.tables {
                 let _ = writeln!(
                     s,
@@ -763,5 +997,99 @@ mod tests {
         );
         assert_eq!(r.locate("test", "t", None), (None, Reason::Default));
         assert_eq!(r.locate("test", "missing", None), (None, Reason::Default));
+
+        // A draining backend gets no transactions; its rows fall back to the
+        // current backend.
+        r.drain("b:1");
+        assert_eq!(
+            r.locate("test", "t", Some(("id", 5000))),
+            (None, Reason::Default)
+        );
+        r.resume("b:1");
+        assert_eq!(
+            r.locate("test", "t", Some(("id", 5000))),
+            (Some("b:1".into()), Reason::Point)
+        );
+    }
+
+    fn two_backends() -> Arc<Router> {
+        let r = Router::new(vec![], vec![]);
+        if let Ok(mut s) = r.state.write() {
+            s.backends = ["a:1", "b:1"]
+                .iter()
+                .map(|a| Backend {
+                    sql_addr: (*a).into(),
+                    status_addr: String::new(),
+                    store_id: 0,
+                })
+                .collect();
+        }
+        r
+    }
+
+    #[test]
+    fn drain_and_resume() {
+        let r = two_backends();
+        let mut rx = r.subscribe_drain();
+        assert!(!r.any_draining());
+        r.drain("a:1");
+        assert!(rx.has_changed().unwrap_or(false));
+        rx.mark_unchanged();
+        assert!(r.any_draining() && r.is_draining("a:1") && !r.is_draining("b:1"));
+        for _ in 0..4 {
+            assert_eq!(r.pick_open().as_deref(), Some("b:1"));
+        }
+        // Draining again changes nothing.
+        r.drain("a:1");
+        assert!(!rx.has_changed().unwrap_or(true));
+        // With every backend draining, new sessions still get one, but no
+        // session moves to a draining backend.
+        r.drain("b:1");
+        assert!(r.pick_default().is_some());
+        assert_eq!(r.pick_open(), None);
+        r.resume("a:1");
+        r.resume("b:1");
+        assert!(!r.any_draining() && !r.is_draining("a:1"));
+        assert!(rx.has_changed().unwrap_or(false));
+        // An address that left /info/all counts as draining.
+        assert!(r.is_draining("gone:1"));
+    }
+
+    #[test]
+    fn failed_probes_drain() {
+        let r = two_backends();
+        let fail = |d: &mut Drain| {
+            d.failures += 1;
+            if d.failures >= PROBE_FAILURES {
+                d.unhealthy = true;
+            }
+        };
+        r.update_drain("a:1", fail);
+        assert!(!r.is_draining("a:1"), "one failed probe is not enough");
+        r.update_drain("a:1", fail);
+        assert!(r.is_draining("a:1"));
+        // An operator's resume does not open an unhealthy backend.
+        r.resume("a:1");
+        assert!(r.is_draining("a:1"));
+        r.update_drain("a:1", |d| {
+            d.failures = 0;
+            d.unhealthy = false;
+        });
+        assert!(!r.is_draining("a:1"));
+    }
+
+    #[test]
+    fn backends_json_counts_connections() {
+        let r = two_backends();
+        let c = r.conn_counter("a:1");
+        c.fetch_add(3, Ordering::Relaxed);
+        r.drain("a:1");
+        let j = r.backends_json();
+        let a = &j[0];
+        assert_eq!(a["addr"], "a:1");
+        assert_eq!(a["connections"], 3);
+        assert_eq!(a["draining"], true);
+        assert_eq!(a["drain_requested"], true);
+        assert_eq!(j[1]["connections"], 0);
     }
 }
