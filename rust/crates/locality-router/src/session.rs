@@ -61,7 +61,10 @@ use crate::kill::{self, SessionHandle};
 use crate::router::{Reason, Router};
 use crate::wire::{self, HandshakeResponse, PacketConn, PacketKind, cap, cmd, status};
 
-const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Timeout of one backend dial. Linux sends a SYN at 0, 1 and 3 s
+/// (`tcp_syn_retries`); a 3 s timeout expired exactly when the third SYN went
+/// out, so two lost SYNs failed the dial. 5 s lets the third SYN complete.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const CLASSIFY_CACHE_LIMIT: usize = 512;
 /// A classified statement and its INSERT point candidates.
 type Entry = (Classified, Vec<(String, Value)>);
@@ -223,6 +226,52 @@ async fn dial(addr: &str) -> io::Result<PacketConn> {
     Ok(PacketConn::new(s))
 }
 
+/// Dials `first` for a new session and reads its greeting. Nothing has been
+/// sent to the client yet, so a backend that cannot be reached is replaced by
+/// another one (an open one first) until every backend was tried. Returns the
+/// backend address, the connection and the greeting.
+async fn dial_for_session(
+    router: &Router,
+    first: String,
+) -> io::Result<(String, PacketConn, Vec<u8>)> {
+    let mut tried: Vec<String> = Vec::new();
+    let mut addr = first;
+    loop {
+        let res = async {
+            let mut conn = dial(&addr).await?;
+            let greeting = conn.read().await?;
+            Ok::<_, io::Error>((conn, greeting))
+        }
+        .await;
+        let e = match res {
+            Ok((conn, greeting)) => return Ok((addr, conn, greeting)),
+            Err(e) => e,
+        };
+        router
+            .counters
+            .handshake_backend_failed
+            .fetch_add(1, Ordering::Relaxed);
+        tried.push(addr);
+        let next = router
+            .backends()
+            .into_iter()
+            .map(|b| b.sql_addr)
+            .filter(|a| !tried.contains(a))
+            .min_by_key(|a| router.is_draining(a));
+        let Some(next) = next else {
+            return Err(other(format!(
+                "no backend reachable (tried {}): {e}",
+                tried.join(", ")
+            )));
+        };
+        eprintln!(
+            "locality-router: new session: backend {}: {e}; trying {next}",
+            tried.last().map_or("", String::as_str)
+        );
+        addr = next;
+    }
+}
+
 fn query_packet(sql: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(sql.len() + 1);
     p.push(cmd::QUERY);
@@ -254,8 +303,8 @@ impl Session {
         backend_addr: String,
     ) -> io::Result<Option<Self>> {
         let mut client = PacketConn::new(client);
-        let mut backend = dial(&backend_addr).await?;
-        let mut greeting = backend.read().await?;
+        let (backend_addr, mut backend, mut greeting) =
+            dial_for_session(&router, backend_addr).await?;
         let g = wire::Greeting::parse(&greeting).ok_or_else(|| other("bad backend greeting"))?;
         // The router speaks plain, uncompressed MySQL to both sides.
         let server_caps =
@@ -1868,6 +1917,46 @@ fn int_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn new_session_skips_unreachable_backend() -> io::Result<()> {
+        // An address with no listener.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .to_string();
+        // A backend that sends one packet (length 1, sequence 0) as its greeting.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let live = listener.local_addr()?.to_string();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let _ = s.write_all(&[1, 0, 0, 0, 0x0a]).await;
+                let mut buf = [0u8; 1];
+                let _ = s.read(&mut buf).await;
+            }
+        });
+        let r = Router::new(vec![], vec![]);
+        r.set_backends_for_test(&[&dead, &live]);
+        let (addr, _conn, greeting) = dial_for_session(&r, dead.clone()).await?;
+        assert_eq!(addr, live);
+        assert_eq!(greeting, vec![0x0a]);
+        assert_eq!(
+            r.counters.handshake_backend_failed.load(Ordering::Relaxed),
+            1
+        );
+
+        // With no reachable backend the error names the ones tried.
+        let r = Router::new(vec![], vec![]);
+        r.set_backends_for_test(&[&dead]);
+        let res = dial_for_session(&r, dead.clone()).await;
+        assert!(
+            matches!(&res, Err(e) if e.to_string().contains("no backend reachable")),
+            "{:?}",
+            res.map(|(a, _, _)| a)
+        );
+        Ok(())
+    }
 
     #[test]
     fn decodes_execute_params() {

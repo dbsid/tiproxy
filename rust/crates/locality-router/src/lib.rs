@@ -28,6 +28,7 @@ pub mod wire;
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -130,15 +131,27 @@ pub async fn run(o: Options) -> io::Result<()> {
             };
             match session::Session::handshake(Arc::clone(&router), client, backend).await {
                 Ok(Some(s)) => {
-                    if let Err(e) = s.run().await
-                        && e.kind() != io::ErrorKind::UnexpectedEof
-                        && e.kind() != io::ErrorKind::ConnectionReset
-                    {
-                        eprintln!("locality-router: session {peer}: {e}");
+                    // A client that goes away between commands ends the session
+                    // with Ok inside `run`; an error here is a connection that
+                    // failed mid-command, often the backend closing it (for
+                    // example TiDB after a commit with an undetermined result),
+                    // which the client sees as a lost connection.
+                    if let Err(e) = s.run().await {
+                        router
+                            .counters
+                            .session_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        eprintln!("locality-router: session {peer}: {e} ({:?})", e.kind());
                     }
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("locality-router: handshake {peer}: {e}"),
+                Err(e) => {
+                    router
+                        .counters
+                        .handshake_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    eprintln!("locality-router: handshake {peer}: {e}");
+                }
             }
         });
     }

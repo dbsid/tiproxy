@@ -168,6 +168,13 @@ pub struct Counters {
     pub txn_routed: AtomicU64,
     /// Client connections accepted.
     pub connections: AtomicU64,
+    /// Backends that could not be reached for a new session (dial or
+    /// greeting failed); the session tried another backend.
+    pub handshake_backend_failed: AtomicU64,
+    /// New sessions that failed before or during authentication.
+    pub handshake_failed: AtomicU64,
+    /// Sessions ended by an error on the client or a backend connection.
+    pub session_errors: AtomicU64,
     /// Sessions moved off a draining backend.
     pub drain_moved: AtomicU64,
 }
@@ -307,6 +314,21 @@ impl Router {
             .read()
             .map(|s| s.backends.clone())
             .unwrap_or_default()
+    }
+
+    /// Replaces the backend list with servers at `sql_addrs` (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_backends_for_test(&self, sql_addrs: &[&str]) {
+        if let Ok(mut s) = self.state.write() {
+            s.backends = sql_addrs
+                .iter()
+                .map(|a| Backend {
+                    sql_addr: (*a).into(),
+                    status_addr: String::new(),
+                    store_id: 0,
+                })
+                .collect();
+        }
     }
 
     /// Picks the backend of a new connection (round robin over the backends
@@ -777,6 +799,13 @@ impl Router {
         put("verify_total", "{result=\"mismatch\"}", &c.verify_mismatch);
         put("txn_routed_total", "", &c.txn_routed);
         put("connections_total", "", &c.connections);
+        put(
+            "handshake_backend_failed_total",
+            "",
+            &c.handshake_backend_failed,
+        );
+        put("handshake_failed_total", "", &c.handshake_failed);
+        put("session_errors_total", "", &c.session_errors);
         put("drain_moved_total", "", &c.drain_moved);
         let _ = writeln!(
             s,
