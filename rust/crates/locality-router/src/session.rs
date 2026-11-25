@@ -578,6 +578,28 @@ impl Session {
         let Some(db) = db.clone().or_else(|| self.db.clone()) else {
             return (None, Reason::Default);
         };
+        // Partition groups: an equality on the HASH partition column of any
+        // table of the statement (`FROM customer, warehouse WHERE w_id = ?`)
+        // selects one partition, whose Region is shared by all member tables.
+        for t in std::iter::once(table).chain(c.join_tables.iter().map(|(_, t)| t)) {
+            let tdb = c
+                .join_tables
+                .iter()
+                .find(|(_, n)| n == t)
+                .and_then(|(d, _)| d.clone())
+                .unwrap_or_else(|| db.clone());
+            for p in &c.points {
+                let value = match p.value {
+                    Value::Literal(n) => Some(n),
+                    Value::Param(i) => exec.and_then(|e| e.get(i).copied()),
+                };
+                if let Some(v) = value
+                    && let Some(addr) = self.router.locate_partition(&tdb, t, &p.column, v)
+                {
+                    return (Some(addr), Reason::Partition);
+                }
+            }
+        }
         let point = c
             .point
             .as_ref()
