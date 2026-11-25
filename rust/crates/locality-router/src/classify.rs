@@ -58,6 +58,12 @@ pub struct Classified {
     pub table: Option<(Option<String>, String)>,
     /// Point equality on the first table, if any.
     pub point: Option<Point>,
+    /// Every `column = value` equality of the WHERE clause, in order (the
+    /// first one is `point` for SELECT / UPDATE / DELETE). The router matches
+    /// them against the hash partition column of the tables.
+    pub points: Vec<Point>,
+    /// The other tables of a comma join in FROM (`FROM a, b`), after `table`.
+    pub join_tables: Vec<(Option<String>, String)>,
     /// Whether executing the statement may change session state that a
     /// session migration must carry (variables, prepared statements, ...).
     pub dirty: bool,
@@ -237,8 +243,60 @@ fn is_reserved(w: &str) -> bool {
     )
 }
 
-/// Finds the first `col = value` after `WHERE`, counting placeholders.
-fn where_point(toks: &[Tok], from: usize) -> Option<Point> {
+/// Tables after the first one in a comma join: `FROM a [x], b [y], ...`.
+/// Stops at the first token that is not part of the table list.
+fn comma_join_tables(toks: &[Tok], mut i: usize) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    loop {
+        // Optional alias: `a x` or `a AS x`.
+        if word(toks.get(i)) == Some("as") {
+            i += 2;
+        } else if matches!(toks.get(i), Some(Tok::Word(w)) if !is_clause_word(w)) {
+            i += 1;
+        }
+        if toks.get(i) != Some(&Tok::Punct(b',')) {
+            return out;
+        }
+        i += 1;
+        match table_ref(toks, &mut i) {
+            Some(t) => out.push(t),
+            None => return out,
+        }
+    }
+}
+
+fn is_clause_word(w: &str) -> bool {
+    matches!(
+        w,
+        "where"
+            | "join"
+            | "inner"
+            | "left"
+            | "right"
+            | "cross"
+            | "straight_join"
+            | "on"
+            | "using"
+            | "group"
+            | "order"
+            | "limit"
+            | "for"
+            | "lock"
+            | "union"
+            | "having"
+            | "window"
+            | "set"
+            | "natural"
+            | "partition"
+            | "use"
+            | "force"
+            | "ignore"
+    )
+}
+
+/// Every `col = value` after `WHERE`, in order, counting placeholders.
+fn where_points(toks: &[Tok], from: usize) -> Vec<Point> {
+    let mut out = Vec::new();
     let mut params_before = toks[..from].iter().filter(|t| **t == Tok::Param).count();
     let mut i = from;
     while i < toks.len() && word(toks.get(i)) != Some("where") {
@@ -247,27 +305,29 @@ fn where_point(toks: &[Tok], from: usize) -> Option<Point> {
         }
         i += 1;
     }
-    while i + 2 < toks.len() {
-        if toks[i] == Tok::Param {
-            params_before += 1;
-        }
-        if let (Some(col), Tok::Punct(b'='), v) = (ident(toks.get(i)), &toks[i + 1], &toks[i + 2]) {
-            // Skip qualified `t.col` prefixes by taking the last identifier.
+    while i < toks.len() {
+        if i + 2 < toks.len()
+            && let (Some(col), Tok::Punct(b'='), v) =
+                (ident(toks.get(i)), &toks[i + 1], &toks[i + 2])
+        {
             let value = match v {
                 Tok::Int(n) => Some(Value::Literal(*n)),
                 Tok::Param => Some(Value::Param(params_before)),
                 _ => None,
             };
             if let Some(value) = value {
-                return Some(Point {
+                out.push(Point {
                     column: col.to_owned(),
                     value,
                 });
             }
         }
+        if toks[i] == Tok::Param {
+            params_before += 1;
+        }
         i += 1;
     }
-    None
+    out
 }
 
 /// `INSERT INTO t (c1, c2, ...) VALUES (v1, v2, ...)`: value of `column`.
@@ -373,6 +433,8 @@ pub fn classify(sql: &[u8]) -> Classified {
         kind: Kind::Other,
         table: None,
         point: None,
+        points: Vec::new(),
+        join_tables: Vec::new(),
         dirty: true,
         use_db: None,
         prev_dependent,
@@ -431,7 +493,9 @@ pub fn classify(sql: &[u8]) -> Classified {
                 let mut i = pos + 1;
                 c.table = table_ref(&toks, &mut i);
                 if c.table.is_some() {
-                    c.point = where_point(&toks, i);
+                    c.join_tables = comma_join_tables(&toks, i);
+                    c.points = where_points(&toks, i);
+                    c.point = c.points.first().cloned();
                 }
             }
         }
@@ -443,7 +507,8 @@ pub fn classify(sql: &[u8]) -> Classified {
             }
             c.table = table_ref(&toks, &mut i);
             if c.table.is_some() {
-                c.point = where_point(&toks, i);
+                c.points = where_points(&toks, i);
+                c.point = c.points.first().cloned();
             }
         }
         "delete" => {
@@ -452,7 +517,8 @@ pub fn classify(sql: &[u8]) -> Classified {
                 let mut i = pos + 1;
                 c.table = table_ref(&toks, &mut i);
                 if c.table.is_some() {
-                    c.point = where_point(&toks, i);
+                    c.points = where_points(&toks, i);
+                    c.point = c.points.first().cloned();
                 }
             }
         }
@@ -510,6 +576,52 @@ mod tests {
     #[allow(clippy::unnecessary_wraps)] // Compared with `Classified::table`.
     fn t(db: Option<&str>, name: &str) -> Option<(Option<String>, String)> {
         Some((db.map(str::to_owned), name.to_owned()))
+    }
+
+    #[test]
+    fn tpcc_first_statements() {
+        let pt = |c: &str, i: usize| Point {
+            column: c.into(),
+            value: Value::Param(i),
+        };
+        // New-Order: the partition column is on the second table of the join.
+        let c = classify(
+            b"SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = ? AND c_w_id = w_id AND c_d_id = ? AND c_id = ?",
+        );
+        assert_eq!(c.table, t(None, "customer"));
+        assert_eq!(c.join_tables, vec![(None, "warehouse".to_owned())]);
+        assert_eq!(
+            c.points,
+            vec![pt("w_id", 0), pt("c_d_id", 1), pt("c_id", 2)]
+        );
+        // Payment: placeholders in SET come before the WHERE ones.
+        let c = classify(b"UPDATE district SET d_ytd = d_ytd + ? WHERE d_w_id = ? AND d_id = ?");
+        assert_eq!(c.table, t(None, "district"));
+        assert_eq!(c.points, vec![pt("d_w_id", 1), pt("d_id", 2)]);
+        assert_eq!(c.point, Some(pt("d_w_id", 1)));
+        // Delivery, Stock-Level, Order-Status.
+        let c = classify(b"SELECT no_o_id FROM new_order WHERE no_w_id = ? AND no_d_id = ? ORDER BY no_o_id ASC LIMIT 1 FOR UPDATE");
+        assert_eq!(c.points, vec![pt("no_w_id", 0), pt("no_d_id", 1)]);
+        assert!(c.join_tables.is_empty());
+        let c = classify(b"SELECT d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?");
+        assert_eq!(c.points, vec![pt("d_w_id", 0), pt("d_id", 1)]);
+        let c = classify(b"SELECT count(c_id) namecnt FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_last = ?");
+        assert_eq!(
+            c.points,
+            vec![pt("c_w_id", 0), pt("c_d_id", 1), pt("c_last", 2)]
+        );
+        // Aliases and a qualified second table.
+        let c = classify(b"SELECT 1 FROM a x, db2.b AS y, c WHERE y.k = 3");
+        assert_eq!(
+            c.join_tables,
+            vec![
+                (Some("db2".to_owned()), "b".to_owned()),
+                (None, "c".to_owned())
+            ]
+        );
+        // An explicit JOIN is not a comma join.
+        let c = classify(b"SELECT 1 FROM a JOIN b ON a.id = b.id WHERE a.id = 1");
+        assert!(c.join_tables.is_empty());
     }
 
     #[test]

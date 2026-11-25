@@ -114,6 +114,10 @@ pub enum Reason {
     Point,
     /// The single leader of an affinity table / partition.
     Table,
+    /// The single leader of the hash partition selected by an equality on
+    /// the partition column (partition groups: partition i of every member
+    /// table shares one Region).
+    Partition,
     /// No locality information; the current backend is kept.
     Default,
 }
@@ -125,6 +129,8 @@ pub struct Counters {
     pub route_point: AtomicU64,
     /// Routes by table leader.
     pub route_table: AtomicU64,
+    /// Routes by the hash partition of an equality on the partition column.
+    pub route_partition: AtomicU64,
     /// Statements without locality information.
     pub route_default: AtomicU64,
     /// Backend switches to a connection that was already in sync.
@@ -589,6 +595,48 @@ impl Router {
         (addr, reason)
     }
 
+    /// Backend of the hash partition of `db.table` selected by `col = value`,
+    /// when `col` is the table's HASH partition column and every Region of
+    /// that partition has the same leader. Only counts a route when it finds
+    /// one: the caller falls back to [`Router::locate`]'s answer otherwise.
+    #[must_use]
+    pub fn locate_partition(&self, db: &str, table: &str, col: &str, value: i64) -> Option<String> {
+        let key = (db.to_owned(), table.to_owned());
+        let state = self.state.read().ok()?;
+        let Some(route) = state.tables.get(&key) else {
+            drop(state);
+            if let Ok(mut w) = self.wanted.write() {
+                w.insert(key);
+            }
+            return None;
+        };
+        if route.physicals.len() < 2 || route.hash_partition_col.as_deref() != Some(col) {
+            return None;
+        }
+        let n = i64::try_from(route.physicals.len()).ok()?;
+        let p = route
+            .physicals
+            .get(usize::try_from((value % n).abs()).ok()?)?;
+        let mut leaders = p.regions.iter().map(|r| r.leader_store);
+        let first = leaders.next().filter(|l| *l != 0)?;
+        if !leaders.all(|l| l == first) {
+            return None;
+        }
+        let addr = state
+            .backends
+            .iter()
+            .find(|b| b.store_id == first)
+            .map(|b| b.sql_addr.clone())?;
+        drop(state);
+        if self.is_draining(&addr) {
+            return None;
+        }
+        self.counters
+            .route_partition
+            .fetch_add(1, Ordering::Relaxed);
+        Some(addr)
+    }
+
     /// Refreshes backends and the Regions of every known table forever.
     pub async fn refresh_loop(self: Arc<Self>, every: Duration) {
         loop {
@@ -773,6 +821,7 @@ impl Router {
         };
         put("route_total", "{reason=\"point\"}", &c.route_point);
         put("route_total", "{reason=\"table\"}", &c.route_table);
+        put("route_total", "{reason=\"partition\"}", &c.route_partition);
         put("route_total", "{reason=\"default\"}", &c.route_default);
         put("switch_total", "{kind=\"warm\"}", &c.switch_warm);
         put("switch_total", "{kind=\"delta\"}", &c.switch_delta);
@@ -1010,6 +1059,63 @@ mod tests {
         assert_eq!(h.as_deref(), Some("id"));
         assert_eq!(p, None);
         assert_eq!(ids, vec![112]);
+    }
+
+    #[test]
+    fn locate_by_hash_partition() {
+        let r = Router::new(vec![], vec![]);
+        let one = |leader| Region {
+            start: vec![],
+            end: vec![],
+            leader_store: leader,
+        };
+        if let Ok(mut s) = r.state.write() {
+            s.backends = (1..=3)
+                .map(|i| Backend {
+                    sql_addr: format!("s{i}:1"),
+                    status_addr: String::new(),
+                    store_id: i,
+                })
+                .collect();
+            // 3 partitions; partition 2 spans two Regions with different leaders.
+            s.tables.insert(
+                ("tpcc".into(), "district".into()),
+                TableRoute {
+                    handle_col: None,
+                    hash_partition_col: Some("d_w_id".into()),
+                    physicals: vec![
+                        Physical {
+                            id: 100,
+                            regions: vec![one(1)],
+                        },
+                        Physical {
+                            id: 101,
+                            regions: vec![one(2)],
+                        },
+                        Physical {
+                            id: 102,
+                            regions: vec![one(3), one(1)],
+                        },
+                    ],
+                    table_leader: 0,
+                    meta_at: Instant::now(),
+                },
+            );
+        }
+        assert_eq!(
+            r.locate_partition("tpcc", "district", "d_w_id", 3),
+            Some("s1:1".into())
+        );
+        assert_eq!(
+            r.locate_partition("tpcc", "district", "d_w_id", 4),
+            Some("s2:1".into())
+        );
+        assert_eq!(r.locate_partition("tpcc", "district", "d_w_id", 5), None);
+        assert_eq!(r.locate_partition("tpcc", "district", "d_id", 3), None);
+        assert_eq!(r.locate_partition("tpcc", "missing", "d_w_id", 3), None);
+        r.drain("s2:1");
+        assert_eq!(r.locate_partition("tpcc", "district", "d_w_id", 4), None);
+        assert_eq!(r.counters.route_partition.load(Ordering::Relaxed), 2);
     }
 
     #[test]
